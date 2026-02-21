@@ -250,13 +250,14 @@ export default function SessionPage() {
   }, []);
 
   useEffect(() => {
+    // FIX: increased to 15 seconds to reduce load, Vision+Speech now run in parallel
     const analysisInterval = setInterval(async () => {
       if (isProcessing || !isCameraOn || !videoRef.current || !canvasRef.current || isSynthesizingRef.current) return;
 
       setIsProcessing(true);
-      
+
       try {
-        let visionAnalysisText = 'No vision data.';
+        let frameDataUri = '';
         if (videoRef.current && canvasRef.current) {
           const video = videoRef.current;
           const canvas = canvasRef.current;
@@ -265,27 +266,33 @@ export default function SessionPage() {
           const context = canvas.getContext('2d');
           if (context) {
             context.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const frameDataUri = canvas.toDataURL('image/jpeg');
-            
-            try {
-              setActiveAgent('Vision');
-              const visionResult = await realtimeVisionAnalysis({ frameDataUri, currentQuestion });
-              visionAnalysisText = visionResult.actionableAdvice || visionResult.overallImpression;
-              setFeedbackHistory(prev => [...prev, { agent: 'Vision', message: visionAnalysisText }]);
-            } catch (visionError) {
-              console.error('Vision analysis failed silently:', visionError);
-            }
+            frameDataUri = canvas.toDataURL('image/jpeg');
           }
         }
 
-        let speechAnalysisText = 'No new speech to analyze.';
-        if (transcriptRef.current.slice(-500).trim()) {
-           setActiveAgent('Speech');
-           const speechResult = await realtimeSpeechAnalysis({ transcriptSegment: transcriptRef.current.slice(-500), currentQuestion });
-           speechAnalysisText = speechResult.clarityFeedback || speechResult.structureFeedback;
-           setFeedbackHistory(prev => [...prev, { agent: 'Speech', message: speechAnalysisText }]);
-        }
+        // FIX: run Vision and Speech in parallel — same cost, 2x faster
+        setActiveAgent('Vision');
+        const [visionResult, speechResult] = await Promise.all([
+          frameDataUri
+            ? realtimeVisionAnalysis({ frameDataUri, currentQuestion }).catch(() => null)
+            : Promise.resolve(null),
+          transcriptRef.current.slice(-500).trim()
+            ? realtimeSpeechAnalysis({ transcriptSegment: transcriptRef.current.slice(-500), currentQuestion }).catch(() => null)
+            : Promise.resolve(null),
+        ]);
 
+        const visionAnalysisText = visionResult
+          ? (visionResult.actionableAdvice || visionResult.overallImpression)
+          : 'No vision data.';
+
+        const speechAnalysisText = speechResult
+          ? (speechResult.clarityFeedback || speechResult.structureFeedback)
+          : 'No new speech to analyze.';
+
+        if (visionResult) setFeedbackHistory(prev => [...prev, { agent: 'Vision', message: visionAnalysisText }]);
+        if (speechResult) setFeedbackHistory(prev => [...prev, { agent: 'Speech', message: speechAnalysisText }]);
+
+        // Coach runs after both complete
         setActiveAgent('Coach');
         const feedbackResult = await realtimeCoachingFeedback({
           currentQuestion,
@@ -301,7 +308,7 @@ export default function SessionPage() {
       } finally {
         setIsProcessing(false);
       }
-    }, 8000);
+    }, 15000); // FIX: 15 seconds instead of 8
 
     analysisIntervalRef.current = analysisInterval;
 
