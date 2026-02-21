@@ -88,6 +88,7 @@ export default function SessionPage() {
   const [hasCameraPermission, setHasCameraPermission] = useState<boolean | null>(null);
   const [hasMicPermission, setHasMicPermission] = useState<boolean | null>(null);
   const [isSynthesizing, setIsSynthesizing] = useState(false);
+  const [mediaStream, setMediaStream] = useState<MediaStream | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -100,10 +101,17 @@ export default function SessionPage() {
   const router = useRouter();
   const { toast } = useToast();
 
+  // FIX: separate useEffect to attach stream to video — runs when both stream and ref are ready
+  useEffect(() => {
+    if (mediaStream && videoRef.current) {
+      videoRef.current.srcObject = mediaStream;
+      videoRef.current.play().catch(e => console.error('Video play error:', e));
+    }
+  }, [mediaStream]);
+
   const handleEndSession = useCallback(() => {
     sessionStorage.setItem('transcript', sessionTranscriptRef.current);
     sessionStorage.setItem('feedbackHistory', JSON.stringify(feedbackHistory));
-    // Cleanup is called in the main useEffect return
     router.push('/results');
   }, [router, feedbackHistory]);
 
@@ -146,13 +154,13 @@ export default function SessionPage() {
 
   const handleFinishedAnswer = useCallback(async () => {
     if (isProcessing || isSynthesizingRef.current || !currentAnswerTranscriptRef.current.trim()) return;
-  
+
     setIsProcessing(true);
     setActiveAgent('Coach');
-  
+
     const answer = currentAnswerTranscriptRef.current;
-    currentAnswerTranscriptRef.current = ''; 
-  
+    currentAnswerTranscriptRef.current = '';
+
     let feedbackToSpeak = '';
     try {
       let visionAnalysisText = 'No vision data.';
@@ -165,7 +173,6 @@ export default function SessionPage() {
         if (context) {
           context.drawImage(video, 0, 0, canvas.width, canvas.height);
           const frameDataUri = canvas.toDataURL('image/jpeg');
-          
           setActiveAgent('Vision');
           const visionResult = await realtimeVisionAnalysis({ frameDataUri, currentQuestion }).catch(() => null);
           if (visionResult) {
@@ -174,26 +181,26 @@ export default function SessionPage() {
           }
         }
       }
-      
+
       setActiveAgent('Speech');
       const speechResult = await realtimeSpeechAnalysis({ transcriptSegment: answer, currentQuestion }).catch(() => null);
       const speechAnalysisText = speechResult ? (speechResult.clarityFeedback || speechResult.structureFeedback) : 'No new speech to analyze.';
       if (speechResult) setFeedbackHistory(prev => [...prev, { agent: 'Speech', message: speechAnalysisText }]);
-  
+
       setActiveAgent('Coach');
       const feedbackResult = await realtimeCoachingFeedback({
         currentQuestion,
         speechAnalysis: speechAnalysisText,
         visionAnalysis: visionAnalysisText,
       });
-  
+
       setFeedbackHistory(prev => [...prev, { agent: 'Coach', message: feedbackResult.feedbackText }]);
       feedbackToSpeak = feedbackResult.feedbackText;
     } catch (e) {
-      console.error("Error getting feedback", e);
-      feedbackToSpeak = "Let's move on to the next question.";
+      console.error('Error getting feedback', e);
+      feedbackToSpeak = "Good answer. Let's continue.";
     }
-  
+
     let nextQuestion = '';
     try {
       if (followUpCount < 2 && answer.length > 20) {
@@ -206,7 +213,7 @@ export default function SessionPage() {
       } else {
         const nextMainIndex = mainQuestionIndex + 1;
         if (nextMainIndex >= mainQuestions.length) {
-          handleEndSession();
+          speak(feedbackToSpeak, () => handleEndSession());
           return;
         }
         setFollowUpCount(0);
@@ -214,26 +221,24 @@ export default function SessionPage() {
         nextQuestion = mainQuestions[nextMainIndex];
       }
     } catch (e) {
-      console.error("Error getting next question", e);
+      console.error('Error getting next question', e);
       const nextMainIndex = mainQuestionIndex + 1;
       if (nextMainIndex >= mainQuestions.length) {
-        handleEndSession();
+        speak(feedbackToSpeak, () => handleEndSession());
         return;
       }
       setFollowUpCount(0);
       setMainQuestionIndex(nextMainIndex);
       nextQuestion = mainQuestions[nextMainIndex];
     }
-    
+
     speak(feedbackToSpeak, () => {
       setCurrentQuestion(nextQuestion);
       speak(nextQuestion, () => {
         setIsProcessing(false);
       });
     });
-  
   }, [isProcessing, currentQuestion, followUpCount, mainQuestionIndex, handleEndSession, speak, isCameraOn]);
-  
 
   const cleanup = useCallback(() => {
     if (speechRecognitionRef.current) {
@@ -251,7 +256,6 @@ export default function SessionPage() {
     window.speechSynthesis?.cancel();
   }, []);
 
-
   useEffect(() => {
     async function setupMediaAndRecognition() {
       try {
@@ -264,14 +268,11 @@ export default function SessionPage() {
           }
         });
         mediaStreamRef.current = stream;
+        setMediaStream(stream); // FIX: store in state so useEffect above can attach it
 
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.play().catch(e => console.error('Video play error:', e));
-        }
         setHasCameraPermission(true);
         setHasMicPermission(true);
-        
+
         const customQuestion = sessionStorage.getItem('customQuestion');
         if (customQuestion) {
           mainQuestions[0] = customQuestion;
@@ -280,7 +281,6 @@ export default function SessionPage() {
         const firstQuestion = mainQuestions[0];
         setCurrentQuestion(firstQuestion);
 
-        // Wait for voices to be loaded
         setTimeout(() => speak(firstQuestion, () => {
           setIsTimerRunning(true);
         }), 500);
@@ -298,20 +298,20 @@ export default function SessionPage() {
             let interimTranscript = '';
             let finalTranscript = '';
             for (let i = event.resultIndex; i < event.results.length; ++i) {
-                if (event.results[i].isFinal) {
-                    finalTranscript += event.results[i][0].transcript + ' ';
-                } else {
-                    interimTranscript += event.results[i][0].transcript;
-                }
+              if (event.results[i].isFinal) {
+                finalTranscript += event.results[i][0].transcript + ' ';
+              } else {
+                interimTranscript += event.results[i][0].transcript;
+              }
             }
 
-            if(finalTranscript){
-                sessionTranscriptRef.current += finalTranscript;
-                currentAnswerTranscriptRef.current += finalTranscript;
-                setTranscript(sessionTranscriptRef.current);
+            if (finalTranscript) {
+              sessionTranscriptRef.current += finalTranscript;
+              currentAnswerTranscriptRef.current += finalTranscript;
+              setTranscript(sessionTranscriptRef.current);
             }
-            if(interimTranscript){
-                setTranscript(sessionTranscriptRef.current + interimTranscript);
+            if (interimTranscript) {
+              setTranscript(sessionTranscriptRef.current + interimTranscript);
             }
           };
 
@@ -349,10 +349,9 @@ export default function SessionPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-
   useEffect(() => {
     let timer: NodeJS.Timeout;
-    if(isTimerRunning){
+    if (isTimerRunning) {
       timer = setInterval(() => setSessionTime((prev) => prev + 1), 1000);
     }
     return () => clearInterval(timer);
@@ -413,7 +412,7 @@ export default function SessionPage() {
             {formatTime(sessionTime)}
           </Badge>
           <div className="flex items-center gap-2">
-            <Button variant="outline" size="icon" onClick={() => setIsMuted(p => !p)} title={isMuted ? "Unmute" : "Mute"}>
+            <Button variant="outline" size="icon" onClick={() => setIsMuted(p => !p)} title={isMuted ? 'Unmute' : 'Mute'}>
               {isMuted ? <VolumeX className="h-5 w-5" /> : <Volume2 className="h-5 w-5" />}
             </Button>
             <Button variant="outline" size="icon" onClick={handleCameraToggle} disabled={!hasCameraPermission}>
@@ -468,7 +467,7 @@ export default function SessionPage() {
                 autoPlay
                 muted
                 playsInline
-                className="w-full h-full object-cover rounded-md bg-background"
+                className="w-full h-full object-cover rounded-md"
               />
               <canvas ref={canvasRef} className="hidden" />
 
@@ -486,7 +485,7 @@ export default function SessionPage() {
 
               <div className="absolute bottom-4 left-4 flex items-center gap-2 bg-background/50 backdrop-blur-sm p-2 rounded-lg">
                 <span className="relative flex h-3 w-3">
-                  {(isProcessing) && <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${agentColors[activeAgent]} opacity-75`}></span>}
+                  {isProcessing && <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${agentColors[activeAgent]} opacity-75`}></span>}
                   <span className={`relative inline-flex rounded-full h-3 w-3 ${agentColors[activeAgent]}`}></span>
                 </span>
                 <span className="text-sm font-medium">
@@ -503,7 +502,7 @@ export default function SessionPage() {
               <h2 className="text-2xl font-semibold text-accent">{currentQuestion}</h2>
               <div className="flex-1 overflow-y-auto pr-2">
                 <p className="text-muted-foreground leading-relaxed whitespace-pre-wrap">
-                  {transcript || (!hasMicPermission ? "Microphone access is required to see your live transcript." : "Your live transcript will appear here as you speak...")}
+                  {transcript || (!hasMicPermission ? 'Microphone access is required to see your live transcript.' : 'Your live transcript will appear here as you speak...')}
                 </p>
               </div>
             </CardContent>
