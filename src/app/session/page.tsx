@@ -267,7 +267,7 @@ export default function SessionPage() {
 
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          videoRef.current.play().catch(e => console.error("Error playing video:", e));
+          videoRef.current.play().catch(e => console.error('Video play error:', e));
         }
         setHasCameraPermission(true);
         setHasMicPermission(true);
