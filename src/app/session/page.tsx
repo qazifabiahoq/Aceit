@@ -93,7 +93,6 @@ export default function SessionPage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const speechRecognitionRef = useRef<any | null>(null);
-  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const isSynthesizingRef = useRef(false);
   const sessionTranscriptRef = useRef('');
   const currentAnswerTranscriptRef = useRef('');
@@ -241,10 +240,6 @@ export default function SessionPage() {
       speechRecognitionRef.current.stop();
       speechRecognitionRef.current = null;
     }
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
@@ -314,9 +309,6 @@ export default function SessionPage() {
                 sessionTranscriptRef.current += finalTranscript;
                 currentAnswerTranscriptRef.current += finalTranscript;
                 setTranscript(sessionTranscriptRef.current);
-
-                if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-                silenceTimerRef.current = setTimeout(() => handleFinishedAnswer(), 5000);
             }
             if(interimTranscript){
                 setTranscript(sessionTranscriptRef.current + interimTranscript);
@@ -420,11 +412,6 @@ export default function SessionPage() {
           <Badge variant="outline" className="text-lg py-1 px-3">
             {formatTime(sessionTime)}
           </Badge>
-          {(isSynthesizing || isProcessing) && (
-            <Badge variant="outline" className="text-sm py-1 px-3 text-purple-400 border-purple-400">
-               {isProcessing ? 'AI Processing...' : 'AI Speaking...'}
-            </Badge>
-          )}
           <div className="flex items-center gap-2">
             <Button variant="outline" size="icon" onClick={() => setIsMuted(p => !p)} title={isMuted ? "Unmute" : "Mute"}>
               {isMuted ? <VolumeX className="h-5 w-5" /> : <Volume2 className="h-5 w-5" />}
@@ -435,27 +422,39 @@ export default function SessionPage() {
             <Button variant="outline" size="icon" onClick={handleMicToggle} disabled={!hasMicPermission}>
               {isMicOn ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
             </Button>
-            <AlertDialog>
-              <AlertDialogTrigger asChild>
-                <Button variant="destructive" className="gap-2">
-                  <PhoneOff className="h-5 w-5" />
-                  <span>End Session</span>
-                </Button>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>Are you sure you want to end the session?</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    Your session data will be processed to generate your performance report.
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction onClick={handleEndSession}>Confirm</AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
           </div>
+
+          <Button onClick={handleFinishedAnswer} disabled={isProcessing || isSynthesizing} className="min-w-[150px]">
+            {isProcessing ? (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                Processing...
+              </>
+            ) : (
+              'Next Question'
+            )}
+          </Button>
+
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button variant="destructive" className="gap-2">
+                <PhoneOff className="h-5 w-5" />
+                <span>End Session</span>
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Are you sure you want to end the session?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  Your session data will be processed to generate your performance report.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction onClick={handleEndSession}>Confirm</AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </div>
       </div>
 
