@@ -73,7 +73,6 @@ export default function ResultsPage() {
         const data: ScoreData = await response.json();
         setScores(data);
 
-        // Fetch followup questions
         if (data.improvements && data.improvements.length > 0) {
           setLoadingFollowup(true);
           try {
@@ -84,7 +83,6 @@ export default function ResultsPage() {
               setFollowupQuestions(followupResult);
           } catch (e) {
               console.error('Failed to generate followup questions:', e);
-              // Don't block the UI if this fails
           } finally {
               setLoadingFollowup(false);
           }
@@ -198,7 +196,7 @@ export default function ResultsPage() {
                   <span className="w-20 text-sm text-muted-foreground">{item.agent}</span>
                   <div className="flex-1 bg-muted rounded-full h-4">
                     <div
-                      className="bg-accent h-4 rounded-full"
+                      className="bg-accent h-4 rounded-full transition-all duration-500"
                       style={{ width: `${item.score}%` }}
                     />
                   </div>

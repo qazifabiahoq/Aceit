@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   Camera,
@@ -11,21 +11,37 @@ import {
   BrainCircuit,
   Eye,
   AudioLines,
+  Volume2,
+  VolumeX,
+  Loader2,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import { Skeleton } from '@/components/ui/skeleton';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { useToast } from '@/hooks/use-toast';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog';
+
+import { realtimeSpeechAnalysis } from '@/ai/flows/realtime-speech-analysis-flow';
+import { realtimeVisionAnalysis } from '@/ai/flows/realtime-vision-analysis-flow';
+import { realtimeCoachingFeedback } from '@/ai/flows/realtime-coaching-feedback-flow';
 
 const questions = [
-  "Tell me about yourself.",
-  "What are your biggest strengths?",
-  "What is your greatest weakness?",
-  "Where do you see yourself in five years?",
-  "Why should we hire you?",
+  'Tell me about yourself.',
+  'What are your biggest strengths?',
+  'What is your greatest weakness?',
+  'Where do you see yourself in five years?',
+  'Why should we hire you?',
 ];
 
 const agentIcons: { [key: string]: React.ReactNode } = {
@@ -47,94 +63,313 @@ type Feedback = {
   message: string;
 };
 
+// SpeechRecognition type might not be on window, so we declare it.
+declare global {
+  interface Window {
+    SpeechRecognition: any;
+    webkitSpeechRecognition: any;
+  }
+}
+
 export default function SessionPage() {
   const [sessionTime, setSessionTime] = useState(0);
   const [isCameraOn, setIsCameraOn] = useState(true);
   const [isMicOn, setIsMicOn] = useState(true);
+  const [isMuted, setIsMuted] = useState(false);
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [transcript, setTranscript] = useState('');
-  const [feedback, setFeedback] = useState<Feedback[]>([]);
+  const [feedbackHistory, setFeedbackHistory] = useState<Feedback[]>([]);
   const [activeAgent, setActiveAgent] = useState('Coach');
-  const [isMounted, setIsMounted] = useState(false);
-  
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [hasCameraPermission, setHasCameraPermission] = useState<boolean | null>(null);
+  const [hasMicPermission, setHasMicPermission] = useState<boolean | null>(null);
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const speechRecognitionRef = useRef<any | null>(null);
+  const analysisIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const questionAudioRef = useRef<SpeechSynthesisUtterance | null>(null);
+
   const router = useRouter();
   const { toast } = useToast();
+  
+  const currentQuestion = questions[currentQuestionIndex];
 
-  useEffect(() => {
-    setIsMounted(true);
+  const speak = useCallback((text: string) => {
+    if (isMuted || typeof window === 'undefined' || !window.speechSynthesis) return;
+
+    // Cancel any previous speech
+    window.speechSynthesis.cancel();
+    
+    const utterance = new SpeechSynthesisUtterance(text);
+    const voices = window.speechSynthesis.getVoices();
+    // Find a professional-sounding voice
+    const voice = voices.find(v => v.name.includes('Google') && v.lang.startsWith('en')) || voices.find(v => v.lang.startsWith('en-US')) || voices[0];
+    if (voice) {
+        utterance.voice = voice;
+    }
+    utterance.pitch = 1;
+    utterance.rate = 1;
+    window.speechSynthesis.speak(utterance);
+    return utterance;
+  }, [isMuted]);
+
+  const cleanup = useCallback(() => {
+    console.log('Cleaning up resources...');
+    if (speechRecognitionRef.current) {
+      speechRecognitionRef.current.stop();
+      speechRecognitionRef.current = null;
+    }
+    if (analysisIntervalRef.current) {
+      clearInterval(analysisIntervalRef.current);
+      analysisIntervalRef.current = null;
+    }
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+     if (videoRef.current && videoRef.current.srcObject) {
+      (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
+      videoRef.current.srcObject = null;
+    }
+    window.speechSynthesis?.cancel();
   }, []);
 
+  const handleEndSession = useCallback(() => {
+    sessionStorage.setItem('transcript', transcript);
+    sessionStorage.setItem('feedbackHistory', JSON.stringify(feedbackHistory));
+    cleanup();
+    router.push('/results');
+  }, [router, transcript, feedbackHistory, cleanup]);
+
+  // Main setup for media and speech recognition
   useEffect(() => {
-    const timer = setInterval(() => {
-      setSessionTime((prev) => prev + 1);
-    }, 1000);
+    async function setupMediaAndRecognition() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        mediaStreamRef.current = stream;
+
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+        }
+        setHasCameraPermission(true);
+        setHasMicPermission(true);
+
+        // Read the first question aloud
+        const customQuestion = sessionStorage.getItem('customQuestion');
+        if (customQuestion) {
+            questions[0] = customQuestion; // Replace first question
+            sessionStorage.removeItem('customQuestion');
+        }
+        questionAudioRef.current = speak(questions[0]) as SpeechSynthesisUtterance;
+        
+        // Setup Speech Recognition
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognition) {
+          const recognition = new SpeechRecognition();
+          recognition.continuous = true;
+          recognition.interimResults = true;
+          recognition.lang = 'en-US';
+
+          recognition.onstart = () => {
+            console.log('Speech recognition started');
+          };
+
+          recognition.onresult = (event: any) => {
+            let interimTranscript = '';
+            let finalTranscript = '';
+            for (let i = event.resultIndex; i < event.results.length; ++i) {
+              if (event.results[i].isFinal) {
+                finalTranscript += event.results[i][0].transcript;
+              } else {
+                interimTranscript += event.results[i][0].transcript;
+              }
+            }
+            setTranscript(prev => prev + finalTranscript);
+            
+            if (finalTranscript || interimTranscript) {
+                setIsSpeaking(true);
+                if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+                silenceTimerRef.current = setTimeout(() => {
+                    setIsSpeaking(false);
+                }, 2000);
+            }
+          };
+
+          recognition.onerror = (event: any) => {
+            console.error('Speech recognition error:', event.error);
+            if(event.error === 'not-allowed') {
+              setHasMicPermission(false);
+              toast({
+                  variant: 'destructive',
+                  title: 'Microphone Access Denied',
+                  description: 'Please enable microphone permissions in your browser settings.',
+              });
+            }
+          };
+
+          recognition.onend = () => {
+            console.log('Speech recognition ended.');
+            // It will be restarted automatically if isMicOn is true
+            if (isMicOn) {
+              speechRecognitionRef.current?.start();
+            }
+          };
+
+          speechRecognitionRef.current = recognition;
+          if (isMicOn) {
+            recognition.start();
+          }
+        } else {
+            toast({
+                variant: 'destructive',
+                title: 'Speech Recognition Not Supported',
+                description: 'Your browser does not support the Web Speech API.',
+            });
+        }
+
+      } catch (error) {
+        console.error('Error accessing media devices:', error);
+        toast({
+          variant: 'destructive',
+          title: 'Media Access Denied',
+          description: 'Please enable camera and microphone permissions to start.',
+        });
+        setHasCameraPermission(false);
+        setHasMicPermission(false);
+      }
+    }
+
+    setupMediaAndRecognition();
+
+    return () => {
+      cleanup();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Analysis loop
+  useEffect(() => {
+    analysisIntervalRef.current = setInterval(async () => {
+      if (isProcessing || !isCameraOn || !videoRef.current || !canvasRef.current) return;
+      
+      setIsProcessing(true);
+      setActiveAgent('Vision');
+
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const context = canvas.getContext('2d');
+      if(context) {
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const frameDataUri = canvas.toDataURL('image/jpeg');
+
+        try {
+            const visionPromise = realtimeVisionAnalysis({ frameDataUri, currentQuestion });
+            const speechPromise = isSpeaking ? Promise.resolve(null) : realtimeSpeechAnalysis({ transcriptSegment: transcript.slice(-500), currentQuestion });
+            
+            const [visionResult, speechResult] = await Promise.all([visionPromise, speechPromise]);
+
+            let speechAnalysisText = 'User is currently speaking.';
+            if(speechResult) {
+                setActiveAgent('Speech');
+                speechAnalysisText = `${speechResult.clarityFeedback} ${speechResult.structureFeedback}`;
+                setFeedbackHistory(prev => [...prev, {agent: 'Speech', message: speechAnalysisText}]);
+            }
+
+            let visionAnalysisText = visionResult.overallImpression;
+             setFeedbackHistory(prev => [...prev, {agent: 'Vision', message: visionAnalysisText}]);
+
+
+            setActiveAgent('Coach');
+            const feedbackResult = await realtimeCoachingFeedback({
+                currentQuestion,
+                speechAnalysis: speechAnalysisText,
+                visionAnalysis: visionAnalysisText,
+            });
+
+            setFeedbackHistory(prev => [...prev, {agent: 'Coach', message: feedbackResult.feedbackText}]);
+            speak(feedbackResult.feedbackText);
+            
+        } catch (error) {
+            console.error("Analysis error:", error);
+            // Silently fail as requested
+        } finally {
+            setIsProcessing(false);
+        }
+      } else {
+        setIsProcessing(false);
+      }
+    }, 5000); // Run analysis every 5 seconds
+
+    return () => {
+      if (analysisIntervalRef.current) {
+        clearInterval(analysisIntervalRef.current);
+      }
+    };
+  }, [isProcessing, isCameraOn, isSpeaking, currentQuestion, transcript, speak]);
+
+
+  useEffect(() => {
+    const timer = setInterval(() => setSessionTime((prev) => prev + 1), 1000);
     return () => clearInterval(timer);
   }, []);
   
-  const handleEndSession = useCallback(() => {
-    // In a real app, you would save session data here
-    router.push('/results');
-  }, [router]);
-
-
-  useEffect(() => {
-    const feedbackInterval = setInterval(() => {
-      const agents = ['Speech', 'Vision', 'Coach'];
-      const agent = agents[Math.floor(Math.random() * agents.length)];
-      const messages = {
-          Speech: "Your pace is good, keep it up.",
-          Vision: "Great eye contact. You appear confident.",
-          Coach: "Try to structure your next answer using the STAR method."
-      };
-      setFeedback(prev => [...prev, { agent, message: (messages as any)[agent] }]);
-      setActiveAgent(agent);
-    }, 8000);
-
-    const transcriptInterval = setInterval(() => {
-        setTranscript(prev => prev + " and that's how I approached the problem using a data-driven mindset to achieve a positive outcome. ")
-    }, 5000);
-    
-    return () => {
-        clearInterval(feedbackInterval);
-        clearInterval(transcriptInterval);
+  const handleCameraToggle = () => {
+    if (mediaStreamRef.current) {
+      const videoTrack = mediaStreamRef.current.getVideoTracks()[0];
+      if (videoTrack) {
+        videoTrack.enabled = !isCameraOn;
+        setIsCameraOn(!isCameraOn);
+        toast({
+          title: `Camera ${!isCameraOn ? 'enabled' : 'disabled'}`
+        });
+      }
     }
-  }, []);
+  };
 
+  const handleMicToggle = () => {
+     if (mediaStreamRef.current) {
+      const audioTrack = mediaStreamRef.current.getAudioTracks()[0];
+      if (audioTrack) {
+        audioTrack.enabled = !isMicOn;
+        setIsMicOn(!isMicOn);
+        if(!isMicOn) {
+            speechRecognitionRef.current?.start();
+        } else {
+            speechRecognitionRef.current?.stop();
+        }
+        toast({
+          title: `Microphone ${!isMicOn ? 'enabled' : 'disabled'}`
+        });
+      }
+    }
+  };
+  
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60).toString().padStart(2, '0');
     const secs = (seconds % 60).toString().padStart(2, '0');
     return `${mins}:${secs}`;
   };
 
-  const handleCameraToggle = () => {
-    setIsCameraOn(prev => !prev);
-    toast({
-        title: `Camera ${!isCameraOn ? 'enabled' : 'disabled'}`,
-        description: `Your camera has been ${!isCameraOn ? 'turned on' : 'turned off'}.`,
-    })
-  }
-
-  const handleMicToggle = () => {
-    setIsMicOn(prev => !prev);
-    toast({
-        title: `Microphone ${!isMicOn ? 'enabled' : 'disabled'}`,
-        description: `Your microphone has been ${!isMicOn ? 'turned on' : 'turned off'}.`,
-    })
-  }
-  
-  if (!isMounted) {
-    return (
-        <div className="container mx-auto p-4 md:p-6 lg:p-8 flex-1">
-            <div className="flex justify-between items-center mb-4">
-                <Skeleton className="h-8 w-48" />
-                <Skeleton className="h-8 w-24" />
-            </div>
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-[calc(100vh-200px)]">
-                <Skeleton className="h-full w-full" />
-                <Skeleton className="h-full w-full lg:col-span-2" />
-            </div>
-        </div>
-    )
+  if (hasCameraPermission === null || hasMicPermission === null) {
+     return (
+      <div className="container mx-auto p-4 md:p-6 lg:p-8 flex-1 flex items-center justify-center text-center">
+          <div>
+            <Loader2 className="h-12 w-12 animate-spin mx-auto mb-4" />
+            <h1 className="text-2xl font-bold">Initializing Session...</h1>
+            <p className="text-muted-foreground">Requesting camera and microphone access.</p>
+          </div>
+      </div>
+    );
   }
 
   return (
@@ -148,85 +383,110 @@ export default function SessionPage() {
             {formatTime(sessionTime)}
           </Badge>
           <div className="flex items-center gap-2">
-            <Button variant="outline" size="icon" onClick={handleCameraToggle}>
+            <Button variant="outline" size="icon" onClick={() => setIsMuted(p => !p)} title={isMuted ? "Unmute" : "Mute"}>
+              {isMuted ? <VolumeX className="h-5 w-5" /> : <Volume2 className="h-5 w-5" />}
+            </Button>
+            <Button variant="outline" size="icon" onClick={handleCameraToggle} disabled={!hasCameraPermission}>
               {isCameraOn ? <Camera className="h-5 w-5" /> : <CameraOff className="h-5 w-5" />}
             </Button>
-            <Button variant="outline" size="icon" onClick={handleMicToggle}>
+            <Button variant="outline" size="icon" onClick={handleMicToggle} disabled={!hasMicPermission}>
               {isMicOn ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
             </Button>
-            <Button variant="destructive" size="icon" onClick={handleEndSession}>
-              <PhoneOff className="h-5 w-5" />
-            </Button>
+             <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button variant="destructive" className="gap-2">
+                  <PhoneOff className="h-5 w-5" />
+                  <span>End Session</span>
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Are you sure you want to end the session?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    Your session data will be processed to generate your performance report.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction onClick={handleEndSession}>Confirm</AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </div>
         </div>
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start" style={{height: 'calc(100vh - 180px)'}}>
         
-        {/* Left Column: Camera Feed */}
         <Card className="h-full w-full flex flex-col">
-            <CardContent className="p-2 relative flex-1">
-                {isCameraOn ? (
-                    <div className="w-full h-full bg-muted rounded-md flex items-center justify-center">
-                        <Camera className="h-16 w-16 text-muted-foreground/50"/>
-                    </div>
-                ) : (
-                    <div className="w-full h-full bg-background border rounded-md flex flex-col items-center justify-center">
-                        <CameraOff className="h-16 w-16 text-muted-foreground/50"/>
-                        <p className="mt-4 text-muted-foreground">Camera is off</p>
-                    </div>
-                )}
-                 <div className="absolute bottom-4 left-4 flex items-center gap-2">
-                    <span className="relative flex h-3 w-3">
-                        <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${agentColors[activeAgent]} opacity-75`}></span>
-                        <span className={`relative inline-flex rounded-full h-3 w-3 ${agentColors[activeAgent]}`}></span>
-                    </span>
-                    <span className="text-sm font-medium">
-                        {activeAgent} Agent Active
-                    </span>
-                </div>
-            </CardContent>
+          <CardContent className="p-2 relative flex-1">
+             <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover rounded-md bg-muted" />
+             <canvas ref={canvasRef} className="hidden" />
+
+            {!hasCameraPermission && (
+              <div className="absolute inset-0 bg-background border rounded-md flex flex-col items-center justify-center p-4">
+                <CameraOff className="h-16 w-16 text-muted-foreground/50"/>
+                <Alert variant="destructive" className="mt-4">
+                  <AlertTitle>Camera Access Denied</AlertTitle>
+                  <AlertDescription>Please enable camera permissions in your browser settings to use this feature.</AlertDescription>
+                </Alert>
+              </div>
+            )}
+             
+            {isCameraOn && (
+              <div className="absolute bottom-4 left-4 flex items-center gap-2 bg-background/50 backdrop-blur-sm p-2 rounded-lg">
+                <span className="relative flex h-3 w-3">
+                  {isProcessing ? (
+                    <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${agentColors[activeAgent]} opacity-75`}></span>
+                  ) : null}
+                  <span className={`relative inline-flex rounded-full h-3 w-3 ${agentColors[activeAgent]}`}></span>
+                </span>
+                <span className="text-sm font-medium">
+                  {isProcessing ? `${activeAgent} Agent Analyzing...` : `${activeAgent} Agent Active`}
+                </span>
+              </div>
+            )}
+          </CardContent>
         </Card>
 
-        {/* Center & Right Column Wrapper */}
         <div className="xl:col-span-2 h-full flex flex-col gap-6">
-            <Card className="flex-1 flex flex-col">
-                <CardContent className="p-6 flex-1 flex flex-col gap-4">
-                    <h2 className="text-2xl font-semibold text-accent">{questions[currentQuestionIndex]}</h2>
-                    <div className="flex-1 overflow-y-auto pr-2">
-                         <p className="text-muted-foreground leading-relaxed">
-                            {transcript || "Your live transcript will appear here as you speak..."}
-                         </p>
-                    </div>
-                </CardContent>
-            </Card>
+          <Card className="flex-1 flex flex-col">
+            <CardContent className="p-6 flex-1 flex flex-col gap-4">
+              <h2 className="text-2xl font-semibold text-accent">{currentQuestion}</h2>
+              <div className="flex-1 overflow-y-auto pr-2">
+                <p className="text-muted-foreground leading-relaxed whitespace-pre-wrap">
+                  {transcript || (!hasMicPermission ? "Microphone access is required to see your live transcript." : "Your live transcript will appear here as you speak...")}
+                </p>
+              </div>
+            </CardContent>
+          </Card>
 
-            <Card className="flex-1 flex flex-col">
-                 <CardContent className="p-6 flex-1 flex flex-col gap-4">
-                    <h2 className="text-lg font-semibold">Real-time Feedback</h2>
-                    <div className="flex-1 overflow-y-auto space-y-4 pr-2">
-                        {feedback.length > 0 ? (
-                            feedback.map((item, index) => (
-                                <Alert key={index}>
-                                    <div className="flex items-center gap-2">
-                                        <span className={`p-1.5 rounded-full ${agentColors[item.agent]}`}>
-                                            {agentIcons[item.agent]}
-                                        </span>
-                                        <AlertTitle className="m-0">{item.agent} Agent</AlertTitle>
-                                    </div>
-                                    <AlertDescription className="pt-2 pl-9">
-                                        {item.message}
-                                    </AlertDescription>
-                                </Alert>
-                            ))
-                        ) : (
-                            <div className="flex items-center justify-center h-full">
-                                <p className="text-muted-foreground">Feedback from AI agents will appear here.</p>
-                            </div>
-                        )}
-                    </div>
-                 </CardContent>
-            </Card>
+          <Card className="flex-1 flex flex-col">
+            <CardContent className="p-6 flex-1 flex flex-col gap-4">
+              <h2 className="text-lg font-semibold">Real-time Feedback</h2>
+              <div className="flex-1 overflow-y-auto space-y-4 pr-2">
+                {feedbackHistory.length > 0 ? (
+                  [...feedbackHistory].reverse().map((item, index) => (
+                    <Alert key={index}>
+                      <div className="flex items-center gap-2">
+                        <span className={`p-1.5 rounded-full ${agentColors[item.agent]}`}>
+                          {agentIcons[item.agent]}
+                        </span>
+                        <AlertTitle className="m-0">{item.agent} Agent</AlertTitle>
+                      </div>
+                      <AlertDescription className="pt-2 pl-9">
+                        {item.message}
+                      </AlertDescription>
+                    </Alert>
+                  ))
+                ) : (
+                  <div className="flex items-center justify-center h-full">
+                    <p className="text-muted-foreground">Feedback from AI agents will appear here.</p>
+                  </div>
+                )}
+              </div>
+            </CardContent>
+          </Card>
         </div>
       </div>
     </div>
