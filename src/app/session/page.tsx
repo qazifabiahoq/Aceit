@@ -36,8 +36,9 @@ import {
 import { realtimeSpeechAnalysis } from '@/ai/flows/realtime-speech-analysis-flow';
 import { realtimeVisionAnalysis } from '@/ai/flows/realtime-vision-analysis-flow';
 import { realtimeCoachingFeedback } from '@/ai/flows/realtime-coaching-feedback-flow';
+import { generateSingleFollowupQuestion } from '@/ai/flows/generate-single-followup-question-flow';
 
-const questions = [
+const mainQuestions = [
   'Tell me about yourself.',
   'What are your biggest strengths?',
   'What is your greatest weakness?',
@@ -76,12 +77,14 @@ export default function SessionPage() {
   const [isCameraOn, setIsCameraOn] = useState(true);
   const [isMicOn, setIsMicOn] = useState(true);
   const [isMuted, setIsMuted] = useState(false);
-  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [currentQuestion, setCurrentQuestion] = useState('Initializing...');
+  const [mainQuestionIndex, setMainQuestionIndex] = useState(0);
+  const [followUpCount, setFollowUpCount] = useState(0);
   const [transcript, setTranscript] = useState('');
   const [feedbackHistory, setFeedbackHistory] = useState<Feedback[]>([]);
   const [activeAgent, setActiveAgent] = useState('Coach');
-  const [isSpeaking, setIsSpeaking] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isTimerRunning, setIsTimerRunning] = useState(false);
   const [hasCameraPermission, setHasCameraPermission] = useState<boolean | null>(null);
   const [hasMicPermission, setHasMicPermission] = useState<boolean | null>(null);
   const [isSynthesizing, setIsSynthesizing] = useState(false);
@@ -90,22 +93,26 @@ export default function SessionPage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const speechRecognitionRef = useRef<any | null>(null);
-  const analysisIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const isSynthesizingRef = useRef(false);
-  const transcriptRef = useRef('');
+  const sessionTranscriptRef = useRef('');
+  const currentAnswerTranscriptRef = useRef('');
 
   const router = useRouter();
   const { toast } = useToast();
 
-  const currentQuestion = questions[currentQuestionIndex];
+  const handleEndSession = useCallback(() => {
+    sessionStorage.setItem('transcript', sessionTranscriptRef.current);
+    sessionStorage.setItem('feedbackHistory', JSON.stringify(feedbackHistory));
+    // Cleanup is called in the main useEffect return
+    router.push('/results');
+  }, [router, feedbackHistory]);
 
-  useEffect(() => {
-    transcriptRef.current = transcript;
-  }, [transcript]);
-
-  const speak = useCallback((text: string) => {
-    if (isMuted || typeof window === 'undefined' || !window.speechSynthesis) return;
+  const speak = useCallback((text: string, onEndCallback?: () => void) => {
+    if (isMuted || typeof window === 'undefined' || !window.speechSynthesis) {
+      onEndCallback?.();
+      return;
+    }
     window.speechSynthesis.cancel();
 
     if (speechRecognitionRef.current) {
@@ -127,19 +134,107 @@ export default function SessionPage() {
       if (speechRecognitionRef.current && isMicOn) {
         try { speechRecognitionRef.current.start(); } catch(e) {}
       }
+      onEndCallback?.();
     };
 
     window.speechSynthesis.speak(utterance);
   }, [isMuted, isMicOn]);
 
+  const handleFinishedAnswer = useCallback(async () => {
+    if (isProcessing || isSynthesizingRef.current || !currentAnswerTranscriptRef.current.trim()) return;
+  
+    setIsProcessing(true);
+    setActiveAgent('Coach');
+  
+    const answer = currentAnswerTranscriptRef.current;
+    currentAnswerTranscriptRef.current = ''; 
+  
+    let feedbackToSpeak = '';
+    try {
+      let visionAnalysisText = 'No vision data.';
+      if (isCameraOn && videoRef.current && canvasRef.current) {
+        const video = videoRef.current;
+        const canvas = canvasRef.current;
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+        const context = canvas.getContext('2d');
+        if (context) {
+          context.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const frameDataUri = canvas.toDataURL('image/jpeg');
+          
+          setActiveAgent('Vision');
+          const visionResult = await realtimeVisionAnalysis({ frameDataUri, currentQuestion }).catch(() => null);
+          if (visionResult) {
+            visionAnalysisText = visionResult.actionableAdvice || visionResult.overallImpression;
+            setFeedbackHistory(prev => [...prev, { agent: 'Vision', message: visionAnalysisText }]);
+          }
+        }
+      }
+      
+      setActiveAgent('Speech');
+      const speechResult = await realtimeSpeechAnalysis({ transcriptSegment: answer, currentQuestion }).catch(() => null);
+      const speechAnalysisText = speechResult ? (speechResult.clarityFeedback || speechResult.structureFeedback) : 'No new speech to analyze.';
+      if (speechResult) setFeedbackHistory(prev => [...prev, { agent: 'Speech', message: speechAnalysisText }]);
+  
+      setActiveAgent('Coach');
+      const feedbackResult = await realtimeCoachingFeedback({
+        currentQuestion,
+        speechAnalysis: speechAnalysisText,
+        visionAnalysis: visionAnalysisText,
+      });
+  
+      setFeedbackHistory(prev => [...prev, { agent: 'Coach', message: feedbackResult.feedbackText }]);
+      feedbackToSpeak = feedbackResult.feedbackText;
+    } catch (e) {
+      console.error("Error getting feedback", e);
+      feedbackToSpeak = "Let's move on to the next question.";
+    }
+  
+    let nextQuestion = '';
+    try {
+      if (followUpCount < 2 && answer.length > 20) {
+        const { followupQuestion } = await generateSingleFollowupQuestion({
+          originalQuestion: currentQuestion,
+          userAnswer: answer,
+        });
+        nextQuestion = followupQuestion;
+        setFollowUpCount(c => c + 1);
+      } else {
+        const nextMainIndex = mainQuestionIndex + 1;
+        if (nextMainIndex >= mainQuestions.length) {
+          handleEndSession();
+          return;
+        }
+        setFollowUpCount(0);
+        setMainQuestionIndex(nextMainIndex);
+        nextQuestion = mainQuestions[nextMainIndex];
+      }
+    } catch (e) {
+      console.error("Error getting next question", e);
+      const nextMainIndex = mainQuestionIndex + 1;
+      if (nextMainIndex >= mainQuestions.length) {
+        handleEndSession();
+        return;
+      }
+      setFollowUpCount(0);
+      setMainQuestionIndex(nextMainIndex);
+      nextQuestion = mainQuestions[nextMainIndex];
+    }
+    
+    speak(feedbackToSpeak, () => {
+      setCurrentQuestion(nextQuestion);
+      speak(nextQuestion, () => {
+        setIsProcessing(false);
+      });
+    });
+  
+  }, [isProcessing, currentQuestion, followUpCount, mainQuestionIndex, handleEndSession, speak, isCameraOn]);
+  
+
   const cleanup = useCallback(() => {
     if (speechRecognitionRef.current) {
       speechRecognitionRef.current.stop();
       speechRecognitionRef.current = null;
-    }
-    if (analysisIntervalRef.current) {
-      clearInterval(analysisIntervalRef.current);
-      analysisIntervalRef.current = null;
     }
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
@@ -156,12 +251,6 @@ export default function SessionPage() {
     window.speechSynthesis?.cancel();
   }, []);
 
-  const handleEndSession = useCallback(() => {
-    sessionStorage.setItem('transcript', transcriptRef.current);
-    sessionStorage.setItem('feedbackHistory', JSON.stringify(feedbackHistory));
-    cleanup();
-    router.push('/results');
-  }, [router, feedbackHistory, cleanup]);
 
   useEffect(() => {
     async function setupMediaAndRecognition() {
@@ -178,19 +267,22 @@ export default function SessionPage() {
 
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          // FIX: explicitly call play() to show camera feed
-          videoRef.current.play().catch(e => console.error('Video play error:', e));
         }
         setHasCameraPermission(true);
         setHasMicPermission(true);
-
+        
         const customQuestion = sessionStorage.getItem('customQuestion');
         if (customQuestion) {
-          questions[0] = customQuestion;
+          mainQuestions[0] = customQuestion;
           sessionStorage.removeItem('customQuestion');
         }
+        const firstQuestion = mainQuestions[0];
+        setCurrentQuestion(firstQuestion);
 
-        setTimeout(() => speak(questions[0]), 500);
+        // Wait for voices to be loaded
+        setTimeout(() => speak(firstQuestion, () => {
+          setIsTimerRunning(true);
+        }), 500);
 
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         if (SpeechRecognition) {
@@ -202,28 +294,38 @@ export default function SessionPage() {
           recognition.onresult = (event: any) => {
             if (isSynthesizingRef.current) return;
 
+            let interimTranscript = '';
             let finalTranscript = '';
             for (let i = event.resultIndex; i < event.results.length; ++i) {
-              if (event.results[i].isFinal) {
-                finalTranscript += event.results[i][0].transcript;
-              }
+                if (event.results[i].isFinal) {
+                    finalTranscript += event.results[i][0].transcript + ' ';
+                } else {
+                    interimTranscript += event.results[i][0].transcript;
+                }
             }
-            if (finalTranscript) {
-              setTranscript(prev => prev + ' ' + finalTranscript);
-              setIsSpeaking(true);
-              if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-              silenceTimerRef.current = setTimeout(() => setIsSpeaking(false), 2000);
+
+            if(finalTranscript){
+                sessionTranscriptRef.current += finalTranscript;
+                currentAnswerTranscriptRef.current += finalTranscript;
+                setTranscript(sessionTranscriptRef.current);
+
+                if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+                silenceTimerRef.current = setTimeout(() => handleFinishedAnswer(), 3000);
+            }
+            if(interimTranscript){
+                setTranscript(sessionTranscriptRef.current + interimTranscript);
             }
           };
 
           recognition.onerror = (event: any) => {
+            console.error('Speech recognition error:', event.error);
             if (event.error === 'not-allowed') {
               setHasMicPermission(false);
             }
           };
 
           recognition.onend = () => {
-            if (isMicOn && !isSynthesizingRef.current) {
+            if (isMicOn && !isSynthesizingRef.current && !isProcessing) {
               try { recognition.start(); } catch(e) {}
             }
           };
@@ -249,78 +351,14 @@ export default function SessionPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    // FIX: increased to 15 seconds to reduce load, Vision+Speech now run in parallel
-    const analysisInterval = setInterval(async () => {
-      if (isProcessing || !isCameraOn || !videoRef.current || !canvasRef.current || isSynthesizingRef.current) return;
-
-      setIsProcessing(true);
-
-      try {
-        let frameDataUri = '';
-        if (videoRef.current && canvasRef.current) {
-          const video = videoRef.current;
-          const canvas = canvasRef.current;
-          canvas.width = video.videoWidth || 640;
-          canvas.height = video.videoHeight || 480;
-          const context = canvas.getContext('2d');
-          if (context) {
-            context.drawImage(video, 0, 0, canvas.width, canvas.height);
-            frameDataUri = canvas.toDataURL('image/jpeg');
-          }
-        }
-
-        // FIX: run Vision and Speech in parallel — same cost, 2x faster
-        setActiveAgent('Vision');
-        const [visionResult, speechResult] = await Promise.all([
-          frameDataUri
-            ? realtimeVisionAnalysis({ frameDataUri, currentQuestion }).catch(() => null)
-            : Promise.resolve(null),
-          transcriptRef.current.slice(-500).trim()
-            ? realtimeSpeechAnalysis({ transcriptSegment: transcriptRef.current.slice(-500), currentQuestion }).catch(() => null)
-            : Promise.resolve(null),
-        ]);
-
-        const visionAnalysisText = visionResult
-          ? (visionResult.actionableAdvice || visionResult.overallImpression)
-          : 'No vision data.';
-
-        const speechAnalysisText = speechResult
-          ? (speechResult.clarityFeedback || speechResult.structureFeedback)
-          : 'No new speech to analyze.';
-
-        if (visionResult) setFeedbackHistory(prev => [...prev, { agent: 'Vision', message: visionAnalysisText }]);
-        if (speechResult) setFeedbackHistory(prev => [...prev, { agent: 'Speech', message: speechAnalysisText }]);
-
-        // Coach runs after both complete
-        setActiveAgent('Coach');
-        const feedbackResult = await realtimeCoachingFeedback({
-          currentQuestion,
-          speechAnalysis: speechAnalysisText,
-          visionAnalysis: visionAnalysisText,
-        });
-
-        setFeedbackHistory(prev => [...prev, { agent: 'Coach', message: feedbackResult.feedbackText }]);
-        speak(feedbackResult.feedbackText);
-
-      } catch (error) {
-        console.error('Main analysis loop error:', error);
-      } finally {
-        setIsProcessing(false);
-      }
-    }, 15000); // FIX: 15 seconds instead of 8
-
-    analysisIntervalRef.current = analysisInterval;
-
-    return () => {
-      if (analysisIntervalRef.current) clearInterval(analysisIntervalRef.current);
-    };
-  }, [isProcessing, isCameraOn, currentQuestion, speak]);
 
   useEffect(() => {
-    const timer = setInterval(() => setSessionTime((prev) => prev + 1), 1000);
+    let timer: NodeJS.Timeout;
+    if(isTimerRunning){
+      timer = setInterval(() => setSessionTime((prev) => prev + 1), 1000);
+    }
     return () => clearInterval(timer);
-  }, []);
+  }, [isTimerRunning]);
 
   const handleCameraToggle = () => {
     if (mediaStreamRef.current) {
@@ -370,15 +408,15 @@ export default function SessionPage() {
     <div className="container mx-auto p-4 md:p-6 lg:p-8 flex-1">
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
         <h1 className="text-xl md:text-2xl font-bold">
-          Question {currentQuestionIndex + 1}/{questions.length}
+          Question {mainQuestionIndex + 1}/{mainQuestions.length}
         </h1>
         <div className="flex items-center gap-4">
           <Badge variant="outline" className="text-lg py-1 px-3">
             {formatTime(sessionTime)}
           </Badge>
-          {isSynthesizing && (
+          {(isSynthesizing || isProcessing) && (
             <Badge variant="outline" className="text-sm py-1 px-3 text-purple-400 border-purple-400">
-              AI Speaking...
+               {isProcessing ? 'AI Processing...' : 'AI Speaking...'}
             </Badge>
           )}
           <div className="flex items-center gap-2">
@@ -443,7 +481,7 @@ export default function SessionPage() {
 
               <div className="absolute bottom-4 left-4 flex items-center gap-2 bg-background/50 backdrop-blur-sm p-2 rounded-lg">
                 <span className="relative flex h-3 w-3">
-                  {isProcessing && <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${agentColors[activeAgent]} opacity-75`}></span>}
+                  {(isProcessing) && <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${agentColors[activeAgent]} opacity-75`}></span>}
                   <span className={`relative inline-flex rounded-full h-3 w-3 ${agentColors[activeAgent]}`}></span>
                 </span>
                 <span className="text-sm font-medium">
