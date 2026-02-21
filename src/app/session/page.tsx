@@ -108,7 +108,6 @@ export default function SessionPage() {
     if (isMuted || typeof window === 'undefined' || !window.speechSynthesis) return;
     window.speechSynthesis.cancel();
 
-    // Pause mic while AI is speaking to prevent feedback loop
     if (speechRecognitionRef.current) {
       speechRecognitionRef.current.stop();
     }
@@ -123,7 +122,6 @@ export default function SessionPage() {
     utterance.rate = 1;
 
     utterance.onend = () => {
-      // Resume mic after AI stops speaking
       isSynthesizingRef.current = false;
       setIsSynthesizing(false);
       if (speechRecognitionRef.current && isMicOn) {
@@ -168,7 +166,6 @@ export default function SessionPage() {
   useEffect(() => {
     async function setupMediaAndRecognition() {
       try {
-        // Use echoCancellation to prevent mic picking up speakers
         const stream = await navigator.mediaDevices.getUserMedia({
           video: true,
           audio: {
@@ -181,6 +178,8 @@ export default function SessionPage() {
 
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
+          // FIX: explicitly call play() to show camera feed
+          videoRef.current.play().catch(e => console.error('Video play error:', e));
         }
         setHasCameraPermission(true);
         setHasMicPermission(true);
@@ -201,7 +200,6 @@ export default function SessionPage() {
           recognition.lang = 'en-US';
 
           recognition.onresult = (event: any) => {
-            // Don't capture transcript while AI is speaking
             if (isSynthesizingRef.current) return;
 
             let finalTranscript = '';
@@ -258,7 +256,6 @@ export default function SessionPage() {
       setIsProcessing(true);
       
       try {
-        // Vision Analysis
         let visionAnalysisText = 'No vision data.';
         if (videoRef.current && canvasRef.current) {
           const video = videoRef.current;
@@ -277,12 +274,10 @@ export default function SessionPage() {
               setFeedbackHistory(prev => [...prev, { agent: 'Vision', message: visionAnalysisText }]);
             } catch (visionError) {
               console.error('Vision analysis failed silently:', visionError);
-              // Fail silently and continue
             }
           }
         }
 
-        // Speech Analysis
         let speechAnalysisText = 'No new speech to analyze.';
         if (transcriptRef.current.slice(-500).trim()) {
            setActiveAgent('Speech');
@@ -291,7 +286,6 @@ export default function SessionPage() {
            setFeedbackHistory(prev => [...prev, { agent: 'Speech', message: speechAnalysisText }]);
         }
 
-        // Coaching Feedback
         setActiveAgent('Coach');
         const feedbackResult = await realtimeCoachingFeedback({
           currentQuestion,
