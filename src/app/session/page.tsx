@@ -27,6 +27,7 @@ import {
   AlertDialogCancel,
   AlertDialogContent,
   AlertDialogDescription,
+  AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
   AlertDialogTrigger,
@@ -63,7 +64,6 @@ type Feedback = {
   message: string;
 };
 
-// SpeechRecognition type might not be on window, so we declare it.
 declare global {
   interface Window {
     SpeechRecognition: any;
@@ -84,6 +84,7 @@ export default function SessionPage() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [hasCameraPermission, setHasCameraPermission] = useState<boolean | null>(null);
   const [hasMicPermission, setHasMicPermission] = useState<boolean | null>(null);
+  const [isSynthesizing, setIsSynthesizing] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -91,34 +92,44 @@ export default function SessionPage() {
   const speechRecognitionRef = useRef<any | null>(null);
   const analysisIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const questionAudioRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const isSynthesizingRef = useRef(false);
 
   const router = useRouter();
   const { toast } = useToast();
-  
+
   const currentQuestion = questions[currentQuestionIndex];
 
   const speak = useCallback((text: string) => {
     if (isMuted || typeof window === 'undefined' || !window.speechSynthesis) return;
-
-    // Cancel any previous speech
     window.speechSynthesis.cancel();
-    
+
+    // Pause mic while AI is speaking to prevent feedback loop
+    if (speechRecognitionRef.current) {
+      speechRecognitionRef.current.stop();
+    }
+    isSynthesizingRef.current = true;
+    setIsSynthesizing(true);
+
     const utterance = new SpeechSynthesisUtterance(text);
     const voices = window.speechSynthesis.getVoices();
-    // Find a professional-sounding voice
     const voice = voices.find(v => v.name.includes('Google') && v.lang.startsWith('en')) || voices.find(v => v.lang.startsWith('en-US')) || voices[0];
-    if (voice) {
-        utterance.voice = voice;
-    }
+    if (voice) utterance.voice = voice;
     utterance.pitch = 1;
     utterance.rate = 1;
+
+    utterance.onend = () => {
+      // Resume mic after AI stops speaking
+      isSynthesizingRef.current = false;
+      setIsSynthesizing(false);
+      if (speechRecognitionRef.current && isMicOn) {
+        try { speechRecognitionRef.current.start(); } catch(e) {}
+      }
+    };
+
     window.speechSynthesis.speak(utterance);
-    return utterance;
-  }, [isMuted]);
+  }, [isMuted, isMicOn]);
 
   const cleanup = useCallback(() => {
-    console.log('Cleaning up resources...');
     if (speechRecognitionRef.current) {
       speechRecognitionRef.current.stop();
       speechRecognitionRef.current = null;
@@ -135,7 +146,7 @@ export default function SessionPage() {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
     }
-     if (videoRef.current && videoRef.current.srcObject) {
+    if (videoRef.current && videoRef.current.srcObject) {
       (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
       videoRef.current.srcObject = null;
     }
@@ -149,28 +160,35 @@ export default function SessionPage() {
     router.push('/results');
   }, [router, transcript, feedbackHistory, cleanup]);
 
-  // Main setup for media and speech recognition
   useEffect(() => {
     async function setupMediaAndRecognition() {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        // Use echoCancellation to prevent mic picking up speakers
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            sampleRate: 44100,
+          }
+        });
         mediaStreamRef.current = stream;
 
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(e => console.error('Video play error:', e));
         }
         setHasCameraPermission(true);
         setHasMicPermission(true);
 
-        // Read the first question aloud
         const customQuestion = sessionStorage.getItem('customQuestion');
         if (customQuestion) {
-            questions[0] = customQuestion; // Replace first question
-            sessionStorage.removeItem('customQuestion');
+          questions[0] = customQuestion;
+          sessionStorage.removeItem('customQuestion');
         }
-        questionAudioRef.current = speak(questions[0]) as SpeechSynthesisUtterance;
-        
-        // Setup Speech Recognition
+
+        setTimeout(() => speak(questions[0]), 500);
+
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         if (SpeechRecognition) {
           const recognition = new SpeechRecognition();
@@ -178,61 +196,38 @@ export default function SessionPage() {
           recognition.interimResults = true;
           recognition.lang = 'en-US';
 
-          recognition.onstart = () => {
-            console.log('Speech recognition started');
-          };
-
           recognition.onresult = (event: any) => {
-            let interimTranscript = '';
+            // Don't capture transcript while AI is speaking
+            if (isSynthesizingRef.current) return;
+
             let finalTranscript = '';
             for (let i = event.resultIndex; i < event.results.length; ++i) {
               if (event.results[i].isFinal) {
                 finalTranscript += event.results[i][0].transcript;
-              } else {
-                interimTranscript += event.results[i][0].transcript;
               }
             }
-            setTranscript(prev => prev + finalTranscript);
-            
-            if (finalTranscript || interimTranscript) {
-                setIsSpeaking(true);
-                if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-                silenceTimerRef.current = setTimeout(() => {
-                    setIsSpeaking(false);
-                }, 2000);
+            if (finalTranscript) {
+              setTranscript(prev => prev + ' ' + finalTranscript);
+              setIsSpeaking(true);
+              if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+              silenceTimerRef.current = setTimeout(() => setIsSpeaking(false), 2000);
             }
           };
 
           recognition.onerror = (event: any) => {
-            console.error('Speech recognition error:', event.error);
-            if(event.error === 'not-allowed') {
+            if (event.error === 'not-allowed') {
               setHasMicPermission(false);
-              toast({
-                  variant: 'destructive',
-                  title: 'Microphone Access Denied',
-                  description: 'Please enable microphone permissions in your browser settings.',
-              });
             }
           };
 
           recognition.onend = () => {
-            console.log('Speech recognition ended.');
-            // It will be restarted automatically if isMicOn is true
-            if (isMicOn) {
-              speechRecognitionRef.current?.start();
+            if (isMicOn && !isSynthesizingRef.current) {
+              try { recognition.start(); } catch(e) {}
             }
           };
 
           speechRecognitionRef.current = recognition;
-          if (isMicOn) {
-            recognition.start();
-          }
-        } else {
-            toast({
-                variant: 'destructive',
-                title: 'Speech Recognition Not Supported',
-                description: 'Your browser does not support the Web Speech API.',
-            });
+          recognition.start();
         }
 
       } catch (error) {
@@ -248,112 +243,97 @@ export default function SessionPage() {
     }
 
     setupMediaAndRecognition();
-
-    return () => {
-      cleanup();
-    };
+    return () => cleanup();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Analysis loop
   useEffect(() => {
     analysisIntervalRef.current = setInterval(async () => {
-      if (isProcessing || !isCameraOn || !videoRef.current || !canvasRef.current) return;
-      
+      if (isProcessing || !isCameraOn || !videoRef.current || !canvasRef.current || isSynthesizingRef.current) return;
+
       setIsProcessing(true);
       setActiveAgent('Vision');
 
       const video = videoRef.current;
       const canvas = canvasRef.current;
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
+      canvas.width = video.videoWidth || 640;
+      canvas.height = video.videoHeight || 480;
       const context = canvas.getContext('2d');
-      if(context) {
+      if (context) {
         context.drawImage(video, 0, 0, canvas.width, canvas.height);
         const frameDataUri = canvas.toDataURL('image/jpeg');
 
         try {
-            const visionPromise = realtimeVisionAnalysis({ frameDataUri, currentQuestion });
-            const speechPromise = isSpeaking ? Promise.resolve(null) : realtimeSpeechAnalysis({ transcriptSegment: transcript.slice(-500), currentQuestion });
-            
-            const [visionResult, speechResult] = await Promise.all([visionPromise, speechPromise]);
+          const visionPromise = realtimeVisionAnalysis({ frameDataUri, currentQuestion });
+          const speechPromise = realtimeSpeechAnalysis({ transcriptSegment: transcript.slice(-500), currentQuestion });
 
-            let speechAnalysisText = 'User is currently speaking.';
-            if(speechResult) {
-                setActiveAgent('Speech');
-                speechAnalysisText = `${speechResult.clarityFeedback} ${speechResult.structureFeedback}`;
-                setFeedbackHistory(prev => [...prev, {agent: 'Speech', message: speechAnalysisText}]);
-            }
+          const [visionResult, speechResult] = await Promise.all([visionPromise, speechPromise]);
 
-            let visionAnalysisText = visionResult.overallImpression;
-             setFeedbackHistory(prev => [...prev, {agent: 'Vision', message: visionAnalysisText}]);
+          let speechAnalysisText = '';
+          if (speechResult) {
+            setActiveAgent('Speech');
+            speechAnalysisText = `${speechResult.clarityFeedback} ${speechResult.structureFeedback}`;
+            setFeedbackHistory(prev => [...prev, { agent: 'Speech', message: speechAnalysisText }]);
+          }
 
+          const visionAnalysisText = visionResult.overallImpression;
+          setFeedbackHistory(prev => [...prev, { agent: 'Vision', message: visionAnalysisText }]);
 
-            setActiveAgent('Coach');
-            const feedbackResult = await realtimeCoachingFeedback({
-                currentQuestion,
-                speechAnalysis: speechAnalysisText,
-                visionAnalysis: visionAnalysisText,
-            });
+          setActiveAgent('Coach');
+          const feedbackResult = await realtimeCoachingFeedback({
+            currentQuestion,
+            speechAnalysis: speechAnalysisText || 'No speech yet',
+            visionAnalysis: visionAnalysisText,
+          });
 
-            setFeedbackHistory(prev => [...prev, {agent: 'Coach', message: feedbackResult.feedbackText}]);
-            speak(feedbackResult.feedbackText);
-            
+          setFeedbackHistory(prev => [...prev, { agent: 'Coach', message: feedbackResult.feedbackText }]);
+          speak(feedbackResult.feedbackText);
+
         } catch (error) {
-            console.error("Analysis error:", error);
-            // Silently fail as requested
+          console.error('Analysis error:', error);
         } finally {
-            setIsProcessing(false);
+          setIsProcessing(false);
         }
       } else {
         setIsProcessing(false);
       }
-    }, 5000); // Run analysis every 5 seconds
+    }, 8000);
 
     return () => {
-      if (analysisIntervalRef.current) {
-        clearInterval(analysisIntervalRef.current);
-      }
+      if (analysisIntervalRef.current) clearInterval(analysisIntervalRef.current);
     };
-  }, [isProcessing, isCameraOn, isSpeaking, currentQuestion, transcript, speak]);
-
+  }, [isProcessing, isCameraOn, currentQuestion, transcript, speak]);
 
   useEffect(() => {
     const timer = setInterval(() => setSessionTime((prev) => prev + 1), 1000);
     return () => clearInterval(timer);
   }, []);
-  
+
   const handleCameraToggle = () => {
     if (mediaStreamRef.current) {
       const videoTrack = mediaStreamRef.current.getVideoTracks()[0];
       if (videoTrack) {
         videoTrack.enabled = !isCameraOn;
         setIsCameraOn(!isCameraOn);
-        toast({
-          title: `Camera ${!isCameraOn ? 'enabled' : 'disabled'}`
-        });
       }
     }
   };
 
   const handleMicToggle = () => {
-     if (mediaStreamRef.current) {
+    if (mediaStreamRef.current) {
       const audioTrack = mediaStreamRef.current.getAudioTracks()[0];
       if (audioTrack) {
         audioTrack.enabled = !isMicOn;
         setIsMicOn(!isMicOn);
-        if(!isMicOn) {
-            speechRecognitionRef.current?.start();
+        if (!isMicOn) {
+          try { speechRecognitionRef.current?.start(); } catch(e) {}
         } else {
-            speechRecognitionRef.current?.stop();
+          speechRecognitionRef.current?.stop();
         }
-        toast({
-          title: `Microphone ${!isMicOn ? 'enabled' : 'disabled'}`
-        });
       }
     }
   };
-  
+
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60).toString().padStart(2, '0');
     const secs = (seconds % 60).toString().padStart(2, '0');
@@ -361,13 +341,13 @@ export default function SessionPage() {
   };
 
   if (hasCameraPermission === null || hasMicPermission === null) {
-     return (
-      <div className="container mx-auto p-4 md:p-6 lg:p-8 flex-1 flex items-center justify-center text-center">
-          <div>
-            <Loader2 className="h-12 w-12 animate-spin mx-auto mb-4" />
-            <h1 className="text-2xl font-bold">Initializing Session...</h1>
-            <p className="text-muted-foreground">Requesting camera and microphone access.</p>
-          </div>
+    return (
+      <div className="container mx-auto p-4 flex-1 flex items-center justify-center text-center">
+        <div>
+          <Loader2 className="h-12 w-12 animate-spin mx-auto mb-4" />
+          <h1 className="text-2xl font-bold">Initializing Session...</h1>
+          <p className="text-muted-foreground">Requesting camera and microphone access.</p>
+        </div>
       </div>
     );
   }
@@ -382,6 +362,11 @@ export default function SessionPage() {
           <Badge variant="outline" className="text-lg py-1 px-3">
             {formatTime(sessionTime)}
           </Badge>
+          {isSynthesizing && (
+            <Badge variant="outline" className="text-sm py-1 px-3 text-purple-400 border-purple-400">
+              AI Speaking...
+            </Badge>
+          )}
           <div className="flex items-center gap-2">
             <Button variant="outline" size="icon" onClick={() => setIsMuted(p => !p)} title={isMuted ? "Unmute" : "Mute"}>
               {isMuted ? <VolumeX className="h-5 w-5" /> : <Volume2 className="h-5 w-5" />}
@@ -392,7 +377,7 @@ export default function SessionPage() {
             <Button variant="outline" size="icon" onClick={handleMicToggle} disabled={!hasMicPermission}>
               {isMicOn ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
             </Button>
-             <AlertDialog>
+            <AlertDialog>
               <AlertDialogTrigger asChild>
                 <Button variant="destructive" className="gap-2">
                   <PhoneOff className="h-5 w-5" />
@@ -416,36 +401,40 @@ export default function SessionPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start" style={{height: 'calc(100vh - 180px)'}}>
-        
-        <Card className="h-full w-full flex flex-col">
-          <CardContent className="p-2 relative flex-1">
-             <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover rounded-md bg-muted" />
-             <canvas ref={canvasRef} className="hidden" />
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start" style={{ height: 'calc(100vh - 180px)' }}>
 
-            {!hasCameraPermission && (
-              <div className="absolute inset-0 bg-background border rounded-md flex flex-col items-center justify-center p-4">
-                <CameraOff className="h-16 w-16 text-muted-foreground/50"/>
-                <Alert variant="destructive" className="mt-4">
-                  <AlertTitle>Camera Access Denied</AlertTitle>
-                  <AlertDescription>Please enable camera permissions in your browser settings to use this feature.</AlertDescription>
-                </Alert>
-              </div>
-            )}
-             
-            {isCameraOn && (
+        <Card className="h-full w-full flex flex-col">
+          <CardContent className="p-2 relative flex-1 flex flex-col">
+            <div className="relative flex-1 min-h-[300px]">
+              <video
+                ref={videoRef}
+                autoPlay
+                muted
+                playsInline
+                style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: '6px', backgroundColor: '#1a1a1a', display: 'block', minHeight: '300px' }}
+              />
+              <canvas ref={canvasRef} className="hidden" />
+
+              {!hasCameraPermission && (
+                <div className="absolute inset-0 bg-background border rounded-md flex flex-col items-center justify-center p-4">
+                  <CameraOff className="h-16 w-16 text-muted-foreground/50" />
+                  <Alert variant="destructive" className="mt-4">
+                    <AlertTitle>Camera Access Denied</AlertTitle>
+                    <AlertDescription>Please enable camera permissions in your browser settings.</AlertDescription>
+                  </Alert>
+                </div>
+              )}
+
               <div className="absolute bottom-4 left-4 flex items-center gap-2 bg-background/50 backdrop-blur-sm p-2 rounded-lg">
                 <span className="relative flex h-3 w-3">
-                  {isProcessing ? (
-                    <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${agentColors[activeAgent]} opacity-75`}></span>
-                  ) : null}
+                  {isProcessing && <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${agentColors[activeAgent]} opacity-75`}></span>}
                   <span className={`relative inline-flex rounded-full h-3 w-3 ${agentColors[activeAgent]}`}></span>
                 </span>
                 <span className="text-sm font-medium">
                   {isProcessing ? `${activeAgent} Agent Analyzing...` : `${activeAgent} Agent Active`}
                 </span>
               </div>
-            )}
+            </div>
           </CardContent>
         </Card>
 
@@ -474,9 +463,7 @@ export default function SessionPage() {
                         </span>
                         <AlertTitle className="m-0">{item.agent} Agent</AlertTitle>
                       </div>
-                      <AlertDescription className="pt-2 pl-9">
-                        {item.message}
-                      </AlertDescription>
+                      <AlertDescription className="pt-2 pl-9">{item.message}</AlertDescription>
                     </Alert>
                   ))
                 ) : (
