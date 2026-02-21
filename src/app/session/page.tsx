@@ -93,11 +93,16 @@ export default function SessionPage() {
   const analysisIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const isSynthesizingRef = useRef(false);
+  const transcriptRef = useRef('');
 
   const router = useRouter();
   const { toast } = useToast();
 
   const currentQuestion = questions[currentQuestionIndex];
+
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
 
   const speak = useCallback((text: string) => {
     if (isMuted || typeof window === 'undefined' || !window.speechSynthesis) return;
@@ -154,11 +159,11 @@ export default function SessionPage() {
   }, []);
 
   const handleEndSession = useCallback(() => {
-    sessionStorage.setItem('transcript', transcript);
+    sessionStorage.setItem('transcript', transcriptRef.current);
     sessionStorage.setItem('feedbackHistory', JSON.stringify(feedbackHistory));
     cleanup();
     router.push('/results');
-  }, [router, transcript, feedbackHistory, cleanup]);
+  }, [router, feedbackHistory, cleanup]);
 
   useEffect(() => {
     async function setupMediaAndRecognition() {
@@ -176,7 +181,6 @@ export default function SessionPage() {
 
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          videoRef.current.play().catch(e => console.error('Video play error:', e));
         }
         setHasCameraPermission(true);
         setHasMicPermission(true);
@@ -248,61 +252,69 @@ export default function SessionPage() {
   }, []);
 
   useEffect(() => {
-    analysisIntervalRef.current = setInterval(async () => {
+    const analysisInterval = setInterval(async () => {
       if (isProcessing || !isCameraOn || !videoRef.current || !canvasRef.current || isSynthesizingRef.current) return;
 
       setIsProcessing(true);
-      setActiveAgent('Vision');
-
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
-      canvas.width = video.videoWidth || 640;
-      canvas.height = video.videoHeight || 480;
-      const context = canvas.getContext('2d');
-      if (context) {
-        context.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const frameDataUri = canvas.toDataURL('image/jpeg');
-
-        try {
-          const visionPromise = realtimeVisionAnalysis({ frameDataUri, currentQuestion });
-          const speechPromise = realtimeSpeechAnalysis({ transcriptSegment: transcript.slice(-500), currentQuestion });
-
-          const [visionResult, speechResult] = await Promise.all([visionPromise, speechPromise]);
-
-          let speechAnalysisText = '';
-          if (speechResult) {
-            setActiveAgent('Speech');
-            speechAnalysisText = `${speechResult.clarityFeedback} ${speechResult.structureFeedback}`;
-            setFeedbackHistory(prev => [...prev, { agent: 'Speech', message: speechAnalysisText }]);
+      
+      try {
+        // Vision Analysis
+        let visionAnalysisText = 'No vision data.';
+        if (videoRef.current && canvasRef.current) {
+          const video = videoRef.current;
+          const canvas = canvasRef.current;
+          canvas.width = video.videoWidth || 640;
+          canvas.height = video.videoHeight || 480;
+          const context = canvas.getContext('2d');
+          if (context) {
+            context.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const frameDataUri = canvas.toDataURL('image/jpeg');
+            
+            try {
+              setActiveAgent('Vision');
+              const visionResult = await realtimeVisionAnalysis({ frameDataUri, currentQuestion });
+              visionAnalysisText = visionResult.actionableAdvice || visionResult.overallImpression;
+              setFeedbackHistory(prev => [...prev, { agent: 'Vision', message: visionAnalysisText }]);
+            } catch (visionError) {
+              console.error('Vision analysis failed silently:', visionError);
+              // Fail silently and continue
+            }
           }
-
-          const visionAnalysisText = visionResult.overallImpression;
-          setFeedbackHistory(prev => [...prev, { agent: 'Vision', message: visionAnalysisText }]);
-
-          setActiveAgent('Coach');
-          const feedbackResult = await realtimeCoachingFeedback({
-            currentQuestion,
-            speechAnalysis: speechAnalysisText || 'No speech yet',
-            visionAnalysis: visionAnalysisText,
-          });
-
-          setFeedbackHistory(prev => [...prev, { agent: 'Coach', message: feedbackResult.feedbackText }]);
-          speak(feedbackResult.feedbackText);
-
-        } catch (error) {
-          console.error('Analysis error:', error);
-        } finally {
-          setIsProcessing(false);
         }
-      } else {
+
+        // Speech Analysis
+        let speechAnalysisText = 'No new speech to analyze.';
+        if (transcriptRef.current.slice(-500).trim()) {
+           setActiveAgent('Speech');
+           const speechResult = await realtimeSpeechAnalysis({ transcriptSegment: transcriptRef.current.slice(-500), currentQuestion });
+           speechAnalysisText = speechResult.clarityFeedback || speechResult.structureFeedback;
+           setFeedbackHistory(prev => [...prev, { agent: 'Speech', message: speechAnalysisText }]);
+        }
+
+        // Coaching Feedback
+        setActiveAgent('Coach');
+        const feedbackResult = await realtimeCoachingFeedback({
+          currentQuestion,
+          speechAnalysis: speechAnalysisText,
+          visionAnalysis: visionAnalysisText,
+        });
+
+        setFeedbackHistory(prev => [...prev, { agent: 'Coach', message: feedbackResult.feedbackText }]);
+        speak(feedbackResult.feedbackText);
+
+      } catch (error) {
+        console.error('Main analysis loop error:', error);
+      } finally {
         setIsProcessing(false);
       }
     }, 8000);
 
+    analysisIntervalRef.current = analysisInterval;
+
     return () => {
       if (analysisIntervalRef.current) clearInterval(analysisIntervalRef.current);
     };
-  }, [isProcessing, isCameraOn, currentQuestion, transcript, speak]);
+  }, [isProcessing, isCameraOn, currentQuestion, speak]);
 
   useEffect(() => {
     const timer = setInterval(() => setSessionTime((prev) => prev + 1), 1000);
@@ -323,9 +335,10 @@ export default function SessionPage() {
     if (mediaStreamRef.current) {
       const audioTrack = mediaStreamRef.current.getAudioTracks()[0];
       if (audioTrack) {
-        audioTrack.enabled = !isMicOn;
-        setIsMicOn(!isMicOn);
-        if (!isMicOn) {
+        const newMicState = !isMicOn;
+        audioTrack.enabled = newMicState;
+        setIsMicOn(newMicState);
+        if (newMicState) {
           try { speechRecognitionRef.current?.start(); } catch(e) {}
         } else {
           speechRecognitionRef.current?.stop();
@@ -411,17 +424,19 @@ export default function SessionPage() {
                 autoPlay
                 muted
                 playsInline
-                style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: '6px', backgroundColor: '#1a1a1a', display: 'block', minHeight: '300px' }}
+                className="w-full h-full object-cover rounded-md bg-background"
               />
               <canvas ref={canvasRef} className="hidden" />
 
-              {!hasCameraPermission && (
+              {(!hasCameraPermission || !isCameraOn) && (
                 <div className="absolute inset-0 bg-background border rounded-md flex flex-col items-center justify-center p-4">
                   <CameraOff className="h-16 w-16 text-muted-foreground/50" />
-                  <Alert variant="destructive" className="mt-4">
-                    <AlertTitle>Camera Access Denied</AlertTitle>
-                    <AlertDescription>Please enable camera permissions in your browser settings.</AlertDescription>
-                  </Alert>
+                  {!hasCameraPermission && (
+                    <Alert variant="destructive" className="mt-4">
+                      <AlertTitle>Camera Access Denied</AlertTitle>
+                      <AlertDescription>Please enable camera permissions in your browser settings.</AlertDescription>
+                    </Alert>
+                  )}
                 </div>
               )}
 
