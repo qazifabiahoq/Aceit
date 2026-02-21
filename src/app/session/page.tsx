@@ -123,7 +123,12 @@ export default function SessionPage() {
 
     const utterance = new SpeechSynthesisUtterance(text);
     const voices = window.speechSynthesis.getVoices();
-    const voice = voices.find(v => v.name.includes('Google') && v.lang.startsWith('en')) || voices.find(v => v.lang.startsWith('en-US')) || voices[0];
+    const voice =
+      voices.find(v => v.name === 'Google UK English Female') ||
+      voices.find(v => v.lang.startsWith('en') && v.name.toLowerCase().includes('female')) ||
+      voices.find(v => v.name.includes('Google') && v.lang.startsWith('en')) ||
+      voices.find(v => v.lang.startsWith('en-US')) ||
+      voices[0];
     if (voice) utterance.voice = voice;
     utterance.pitch = 1;
     utterance.rate = 1;
@@ -267,6 +272,7 @@ export default function SessionPage() {
 
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(e => console.error("Error playing video:", e));
         }
         setHasCameraPermission(true);
         setHasMicPermission(true);
@@ -310,7 +316,7 @@ export default function SessionPage() {
                 setTranscript(sessionTranscriptRef.current);
 
                 if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-                silenceTimerRef.current = setTimeout(() => handleFinishedAnswer(), 3000);
+                silenceTimerRef.current = setTimeout(() => handleFinishedAnswer(), 5000);
             }
             if(interimTranscript){
                 setTranscript(sessionTranscriptRef.current + interimTranscript);
