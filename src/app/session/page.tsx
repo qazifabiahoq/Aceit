@@ -127,9 +127,6 @@ export default function SessionPage() {
       return;
     }
     window.speechSynthesis.cancel();
-    if (speechRecognitionRef.current) {
-      speechRecognitionRef.current.stop();
-    }
     isSynthesizingRef.current = true;
     setIsSynthesizing(true);
 
