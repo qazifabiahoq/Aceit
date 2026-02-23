@@ -38,6 +38,8 @@ import { realtimeVisionAnalysis } from '@/ai/flows/realtime-vision-analysis-flow
 import { realtimeCoachingFeedback } from '@/ai/flows/realtime-coaching-feedback-flow';
 import { generateSingleFollowupQuestion } from '@/ai/flows/generate-single-followup-question-flow';
 
+const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
+
 const mainQuestions = [
   'Tell me about yourself.',
   'What are your biggest strengths?',
@@ -95,13 +97,15 @@ export default function SessionPage() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const speechRecognitionRef = useRef<any | null>(null);
   const isSynthesizingRef = useRef(false);
+  // FIX: use ref for isProcessing so mic restart closure always has current value
+  const isProcessingRef = useRef(false);
   const sessionTranscriptRef = useRef('');
   const currentAnswerTranscriptRef = useRef('');
 
   const router = useRouter();
   const { toast } = useToast();
 
-  // FIX: separate useEffect to attach stream to video — runs when both stream and ref are ready
+  // FIX: attach stream to video via useEffect so ref is guaranteed ready
   useEffect(() => {
     if (mediaStream && videoRef.current) {
       videoRef.current.srcObject = mediaStream;
@@ -121,7 +125,6 @@ export default function SessionPage() {
       return;
     }
     window.speechSynthesis.cancel();
-
     if (speechRecognitionRef.current) {
       speechRecognitionRef.current.stop();
     }
@@ -152,21 +155,17 @@ export default function SessionPage() {
     window.speechSynthesis.speak(utterance);
   }, [isMuted, isMicOn]);
 
-  const isProcessingRef = useRef(false);
-
   const handleFinishedAnswer = useCallback(async () => {
+    // FIX: use ref not state so this never gets stale
     if (isProcessingRef.current || isSynthesizingRef.current) return;
-    if (!currentAnswerTranscriptRef.current.trim()) {
-      // still move to next question even if no transcript
-      currentAnswerTranscriptRef.current = 'No answer provided.';
-    }
+
+    // FIX: allow next question even if transcript is empty
+    const answer = currentAnswerTranscriptRef.current.trim() || 'No answer provided.';
+    currentAnswerTranscriptRef.current = '';
 
     setIsProcessing(true);
     isProcessingRef.current = true;
     setActiveAgent('Coach');
-
-    const answer = currentAnswerTranscriptRef.current;
-    currentAnswerTranscriptRef.current = '';
 
     let feedbackToSpeak = '';
     try {
@@ -191,7 +190,7 @@ export default function SessionPage() {
 
       setActiveAgent('Speech');
       const speechResult = await realtimeSpeechAnalysis({ transcriptSegment: answer, currentQuestion }).catch(() => null);
-      const speechAnalysisText = speechResult ? (speechResult.clarityFeedback || speechResult.structureFeedback) : 'No new speech to analyze.';
+      const speechAnalysisText = speechResult ? (speechResult.clarityFeedback || speechResult.structureFeedback) : 'No speech analyzed.';
       if (speechResult) setFeedbackHistory(prev => [...prev, { agent: 'Speech', message: speechAnalysisText }]);
 
       setActiveAgent('Coach');
@@ -210,7 +209,7 @@ export default function SessionPage() {
 
     let nextQuestion = '';
     try {
-      if (followUpCount < 2 && answer.length > 20) {
+      if (followUpCount < 2 && answer.length > 20 && answer !== 'No answer provided.') {
         const { followupQuestion } = await generateSingleFollowupQuestion({
           originalQuestion: currentQuestion,
           userAnswer: answer,
@@ -246,6 +245,7 @@ export default function SessionPage() {
         isProcessingRef.current = false;
       });
     });
+
   }, [isProcessing, currentQuestion, followUpCount, mainQuestionIndex, handleEndSession, speak, isCameraOn]);
 
   const cleanup = useCallback(() => {
@@ -265,6 +265,10 @@ export default function SessionPage() {
   }, []);
 
   useEffect(() => {
+    if (backendUrl) {
+      fetch(`${backendUrl}/health`).catch(() => {});
+    }
+
     async function setupMediaAndRecognition() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -276,8 +280,7 @@ export default function SessionPage() {
           }
         });
         mediaStreamRef.current = stream;
-        setMediaStream(stream); // FIX: store in state so useEffect above can attach it
-
+        setMediaStream(stream);
         setHasCameraPermission(true);
         setHasMicPermission(true);
 
@@ -289,7 +292,7 @@ export default function SessionPage() {
         const firstQuestion = mainQuestions[0];
         setCurrentQuestion(firstQuestion);
 
-        // FIX: wait for voices to load so first question uses female voice not default male
+        // FIX: wait for voices to load before speaking
         const speakWhenReady = () => {
           const voices = window.speechSynthesis.getVoices();
           if (voices.length > 0) {
@@ -339,6 +342,7 @@ export default function SessionPage() {
             }
           };
 
+          // FIX: use isProcessingRef not isProcessing state to avoid stale closure
           recognition.onend = () => {
             if (isMicOn && !isSynthesizingRef.current && !isProcessingRef.current) {
               try { recognition.start(); } catch(e) {}
@@ -428,6 +432,11 @@ export default function SessionPage() {
           <Badge variant="outline" className="text-lg py-1 px-3">
             {formatTime(sessionTime)}
           </Badge>
+          {isSynthesizing && (
+            <Badge variant="outline" className="text-sm py-1 px-3 text-purple-400 border-purple-400">
+              AI Speaking...
+            </Badge>
+          )}
           <div className="flex items-center gap-2">
             <Button variant="outline" size="icon" onClick={() => setIsMuted(p => !p)} title={isMuted ? 'Unmute' : 'Mute'}>
               {isMuted ? <VolumeX className="h-5 w-5" /> : <Volume2 className="h-5 w-5" />}
