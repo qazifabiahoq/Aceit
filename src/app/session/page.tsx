@@ -195,6 +195,7 @@ export default function SessionPage() {
           const frameDataUri = canvas.toDataURL('image/jpeg');
           setActiveAgent('Vision');
           const visionResult = await realtimeVisionAnalysis({ frameDataUri, currentQuestion }).catch(() => null);
+          console.log('Vision result:', visionResult);
           if (visionResult) {
             visionAnalysisText = visionResult.actionableAdvice || visionResult.overallImpression;
             setFeedbackHistory(prev => [...prev, { agent: 'Vision', message: visionAnalysisText }]);
@@ -204,6 +205,7 @@ export default function SessionPage() {
 
       setActiveAgent('Speech');
       const speechResult = await realtimeSpeechAnalysis({ transcriptSegment: answer, currentQuestion }).catch(() => null);
+      console.log('Speech result:', speechResult);
       const speechAnalysisText = speechResult ? (speechResult.clarityFeedback || speechResult.structureFeedback) : 'No speech analyzed.';
       if (speechResult) setFeedbackHistory(prev => [...prev, { agent: 'Speech', message: speechAnalysisText }]);
 
@@ -213,6 +215,7 @@ export default function SessionPage() {
         speechAnalysis: speechAnalysisText,
         visionAnalysis: visionAnalysisText,
       });
+      console.log('Coach result:', feedbackResult);
 
       setFeedbackHistory(prev => [...prev, { agent: 'Coach', message: feedbackResult.feedbackText }]);
       feedbackToSpeak = feedbackResult.feedbackText;
@@ -228,6 +231,7 @@ export default function SessionPage() {
           originalQuestion: currentQuestion,
           userAnswer: answer,
         });
+        console.log('Followup:', followupQuestion);
         nextQuestion = followupQuestion;
         setFollowUpCount(c => c + 1);
       } else {
@@ -361,7 +365,7 @@ export default function SessionPage() {
           };
           
           recognition.onend = () => {
-            if (isMicOn && !isSynthesizingRef.current) {
+            if (isMicOn) {
               try { recognition.start(); } catch(e) {}
             }
           };
