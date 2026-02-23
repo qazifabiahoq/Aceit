@@ -38,8 +38,6 @@ import { realtimeVisionAnalysis } from '@/ai/flows/realtime-vision-analysis-flow
 import { realtimeCoachingFeedback } from '@/ai/flows/realtime-coaching-feedback-flow';
 import { generateSingleFollowupQuestion } from '@/ai/flows/generate-single-followup-question-flow';
 
-const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
-
 const mainQuestions = [
   'Tell me about yourself.',
   'What are your biggest strengths?',
@@ -154,10 +152,17 @@ export default function SessionPage() {
     window.speechSynthesis.speak(utterance);
   }, [isMuted, isMicOn]);
 
+  const isProcessingRef = useRef(false);
+
   const handleFinishedAnswer = useCallback(async () => {
-    if (isProcessing || isSynthesizingRef.current || !currentAnswerTranscriptRef.current.trim()) return;
+    if (isProcessingRef.current || isSynthesizingRef.current) return;
+    if (!currentAnswerTranscriptRef.current.trim()) {
+      // still move to next question even if no transcript
+      currentAnswerTranscriptRef.current = 'No answer provided.';
+    }
 
     setIsProcessing(true);
+    isProcessingRef.current = true;
     setActiveAgent('Coach');
 
     const answer = currentAnswerTranscriptRef.current;
@@ -238,6 +243,7 @@ export default function SessionPage() {
       setCurrentQuestion(nextQuestion);
       speak(nextQuestion, () => {
         setIsProcessing(false);
+        isProcessingRef.current = false;
       });
     });
   }, [isProcessing, currentQuestion, followUpCount, mainQuestionIndex, handleEndSession, speak, isCameraOn]);
@@ -259,10 +265,6 @@ export default function SessionPage() {
   }, []);
 
   useEffect(() => {
-    if (backendUrl) {
-      fetch(`${backendUrl}/api/warmup`).catch(err => console.error("Failed to warm up backend:", err));
-    }
-
     async function setupMediaAndRecognition() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -287,9 +289,18 @@ export default function SessionPage() {
         const firstQuestion = mainQuestions[0];
         setCurrentQuestion(firstQuestion);
 
-        setTimeout(() => speak(firstQuestion, () => {
-          setIsTimerRunning(true);
-        }), 500);
+        // FIX: wait for voices to load so first question uses female voice not default male
+        const speakWhenReady = () => {
+          const voices = window.speechSynthesis.getVoices();
+          if (voices.length > 0) {
+            speak(firstQuestion, () => setIsTimerRunning(true));
+          } else {
+            window.speechSynthesis.onvoiceschanged = () => {
+              speak(firstQuestion, () => setIsTimerRunning(true));
+            };
+          }
+        };
+        setTimeout(speakWhenReady, 300);
 
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         if (SpeechRecognition) {
@@ -329,7 +340,7 @@ export default function SessionPage() {
           };
 
           recognition.onend = () => {
-            if (isMicOn && !isSynthesizingRef.current && !isProcessing) {
+            if (isMicOn && !isSynthesizingRef.current && !isProcessingRef.current) {
               try { recognition.start(); } catch(e) {}
             }
           };
