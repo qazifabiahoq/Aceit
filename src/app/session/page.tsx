@@ -97,21 +97,39 @@ export default function SessionPage() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const speechRecognitionRef = useRef<any | null>(null);
   const isSynthesizingRef = useRef(false);
-  // FIX: use ref for isProcessing so mic restart closure always has current value
   const isProcessingRef = useRef(false);
+  const isRecognitionRunningRef = useRef(false);
   const sessionTranscriptRef = useRef('');
   const currentAnswerTranscriptRef = useRef('');
+  const restartTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   const router = useRouter();
   const { toast } = useToast();
 
-  // FIX: attach stream to video via useEffect so ref is guaranteed ready
   useEffect(() => {
     if (mediaStream && videoRef.current) {
       videoRef.current.srcObject = mediaStream;
       videoRef.current.play().catch(e => console.error('Video play error:', e));
     }
   }, [mediaStream]);
+
+  const safeStartRecognition = useCallback(() => {
+    if (!speechRecognitionRef.current) return;
+    if (isRecognitionRunningRef.current) return;
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+    }
+    restartTimerRef.current = setTimeout(() => {
+      try {
+        speechRecognitionRef.current?.start();
+        isRecognitionRunningRef.current = true;
+        console.log('Recognition started');
+      } catch(e) {
+        console.log('Start error:', e);
+        isRecognitionRunningRef.current = false;
+      }
+    }, 300);
+  }, []);
 
   const handleEndSession = useCallback(() => {
     console.log('Saving transcript:', sessionTranscriptRef.current);
@@ -142,35 +160,30 @@ export default function SessionPage() {
     utterance.pitch = 1;
     utterance.rate = 1;
 
-    const timeout = setTimeout(() => {
+    const estimatedDuration = (text.length * 70) + 1000;
+    const fallbackTimeout = setTimeout(() => {
       if (isSynthesizingRef.current) {
+        console.log('Speech fallback timeout triggered');
         isSynthesizingRef.current = false;
         setIsSynthesizing(false);
-        if (speechRecognitionRef.current && isMicOn) {
-          try { speechRecognitionRef.current.start(); } catch(e) {}
-        }
         onEndCallback?.();
       }
-    }, (text.length * 80) + 1000);
+    }, estimatedDuration);
 
     utterance.onend = () => {
-      clearTimeout(timeout);
+      clearTimeout(fallbackTimeout);
       isSynthesizingRef.current = false;
       setIsSynthesizing(false);
-      if (speechRecognitionRef.current && isMicOn) {
-        try { speechRecognitionRef.current.start(); } catch(e) {}
-      }
+      console.log('Speech ended, restarting mic');
       onEndCallback?.();
     };
 
     window.speechSynthesis.speak(utterance);
-  }, [isMuted, isMicOn]);
+  }, [isMuted]);
 
   const handleFinishedAnswer = useCallback(async () => {
-    // FIX: use ref not state so this never gets stale
     if (isProcessingRef.current || isSynthesizingRef.current) return;
 
-    // FIX: allow next question even if transcript is empty
     const answer = currentAnswerTranscriptRef.current.trim() || 'No answer provided.';
     currentAnswerTranscriptRef.current = '';
 
@@ -258,23 +271,25 @@ export default function SessionPage() {
       speak(nextQuestion, () => {
         setIsProcessing(false);
         isProcessingRef.current = false;
+        safeStartRecognition();
       });
     });
 
-  }, [isProcessing, currentQuestion, followUpCount, mainQuestionIndex, handleEndSession, speak, isCameraOn]);
+  }, [isProcessing, currentQuestion, followUpCount, mainQuestionIndex, handleEndSession, speak, isCameraOn, safeStartRecognition]);
 
   const cleanup = useCallback(() => {
+    if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
     if (speechRecognitionRef.current) {
-      speechRecognitionRef.current.stop();
+      isRecognitionRunningRef.current = false;
+      speechRecognitionRef.current.onend = null;
+      speechRecognitionRef.current.onerror = null;
+      speechRecognitionRef.current.onresult = null;
+      try { speechRecognitionRef.current.stop(); } catch(e) {}
       speechRecognitionRef.current = null;
     }
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
-    }
-    if (videoRef.current && videoRef.current.srcObject) {
-      (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
-      videoRef.current.srcObject = null;
     }
     window.speechSynthesis?.cancel();
   }, []);
@@ -307,20 +322,6 @@ export default function SessionPage() {
         const firstQuestion = mainQuestions[0];
         setCurrentQuestion(firstQuestion);
 
-        const speakWhenReady = () => {
-          const voices = window.speechSynthesis.getVoices();
-          if (voices.length > 0) {
-            speak(firstQuestion);
-            setTimeout(() => setIsTimerRunning(true), 1000);
-          } else {
-            window.speechSynthesis.onvoiceschanged = () => {
-              speak(firstQuestion);
-              setTimeout(() => setIsTimerRunning(true), 1000);
-            };
-          }
-        };
-        setTimeout(speakWhenReady, 300);
-
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         if (SpeechRecognition) {
           const recognition = new SpeechRecognition();
@@ -329,6 +330,7 @@ export default function SessionPage() {
           recognition.lang = 'en-US';
 
           recognition.onresult = (event: any) => {
+            // ignore results while AI is speaking
             if (isSynthesizingRef.current) return;
 
             let interimTranscript = '';
@@ -342,6 +344,7 @@ export default function SessionPage() {
             }
 
             if (finalTranscript) {
+              console.log('Final transcript captured:', finalTranscript);
               sessionTranscriptRef.current += finalTranscript;
               currentAnswerTranscriptRef.current += finalTranscript;
               setTranscript(sessionTranscriptRef.current);
@@ -353,23 +356,49 @@ export default function SessionPage() {
 
           recognition.onerror = (event: any) => {
             console.error('Speech recognition error:', event.error);
+            isRecognitionRunningRef.current = false;
             if (event.error === 'not-allowed') {
               setHasMicPermission(false);
+              return;
             }
-            if (event.error === 'no-speech' || event.error === 'audio-capture') {
-              try { recognition.start(); } catch(e) {}
+            // for all other errors restart after a short delay
+            if (event.error !== 'aborted') {
+              setTimeout(() => safeStartRecognition(), 500);
             }
           };
-          
+
           recognition.onend = () => {
+            console.log('Recognition ended, restarting...');
+            isRecognitionRunningRef.current = false;
+            // always restart unless mic is toggled off
             if (isMicOn) {
-              try { recognition.start(); } catch(e) {}
+              safeStartRecognition();
             }
           };
 
           speechRecognitionRef.current = recognition;
-          recognition.start();
+
+          // start recognition after a short delay to let page settle
+          setTimeout(() => {
+            safeStartRecognition();
+          }, 500);
         }
+
+        // speak first question after recognition is set up
+        setTimeout(() => {
+          const voices = window.speechSynthesis.getVoices();
+          const doSpeak = () => {
+            speak(firstQuestion, () => {
+              setIsTimerRunning(true);
+              safeStartRecognition();
+            });
+          };
+          if (voices.length > 0) {
+            doSpeak();
+          } else {
+            window.speechSynthesis.onvoiceschanged = doSpeak;
+          }
+        }, 800);
 
       } catch (error) {
         console.error('Error accessing media devices:', error);
@@ -414,9 +443,9 @@ export default function SessionPage() {
         audioTrack.enabled = newMicState;
         setIsMicOn(newMicState);
         if (newMicState) {
-          try { speechRecognitionRef.current?.start(); } catch(e) {}
+          safeStartRecognition();
         } else {
-          speechRecognitionRef.current?.stop();
+          try { speechRecognitionRef.current?.stop(); } catch(e) {}
         }
       }
     }
@@ -502,7 +531,6 @@ export default function SessionPage() {
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start" style={{ height: 'calc(100vh - 180px)' }}>
-
         <Card className="h-full w-full flex flex-col">
           <CardContent className="p-2 relative flex-1 flex flex-col">
             <div className="relative flex-1 min-h-[300px]">
@@ -514,7 +542,6 @@ export default function SessionPage() {
                 className="w-full h-full object-cover rounded-md"
               />
               <canvas ref={canvasRef} className="hidden" />
-
               {(!hasCameraPermission || !isCameraOn) && (
                 <div className="absolute inset-0 bg-background border rounded-md flex flex-col items-center justify-center p-4">
                   <CameraOff className="h-16 w-16 text-muted-foreground/50" />
@@ -526,7 +553,6 @@ export default function SessionPage() {
                   )}
                 </div>
               )}
-
               <div className="absolute bottom-4 left-4 flex items-center gap-2 bg-background/50 backdrop-blur-sm p-2 rounded-lg">
                 <span className="relative flex h-3 w-3">
                   {isProcessing && <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${agentColors[activeAgent]} opacity-75`}></span>}
