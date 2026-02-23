@@ -6,6 +6,9 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import google.generativeai as genai
 
+# Import the agents from agent.py
+from agent import speech_agent, vision_agent, voice_agent, root_agent
+
 load_dotenv()
 
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
@@ -20,19 +23,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-model = genai.GenerativeModel(
+# Keep a simple model for scoring only
+scoring_model = genai.GenerativeModel(
     model_name="gemini-2.5-flash",
-    system_instruction="""You are the lead AI interview coach for AceIt, a real-time interview coaching platform. 
-    AceIt helps job seekers practice and improve their interview skills by providing live feedback on their speech, 
-    body language, and delivery. You have three specialized sub-agents:
-    - Speech Agent: analyzes answer content, structure and clarity
-    - Vision Agent: analyzes facial expressions, eye contact and body language
-    - Voice Agent: monitors tone, pace and confidence of delivery
-    
-    Synthesize all feedback and deliver clear, encouraging, and actionable coaching.
-    Keep feedback concise, specific, and constructive. Never overwhelm the user.
-    Prioritize the most impactful improvement. Speak directly in second person.
-    Be encouraging but honest."""
+    system_instruction="""You are an interview performance evaluator. 
+    Analyze the interview transcript and feedback history and return accurate scores."""
 )
 
 class CoachRequest(BaseModel):
@@ -46,7 +41,11 @@ class ScoreRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "AceIt backend running", "version": "1.0"}
+    return {"status": "AceIt backend running", "version": "2.0", "agents": "connected"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 @app.get("/api/warmup")
 def warmup():
@@ -55,25 +54,56 @@ def warmup():
 @app.post("/coach")
 async def get_coaching(request: CoachRequest):
     try:
+        # Build the prompt for the root Coach Agent
         prompt = f"""
-        The user was asked: "{request.question}"
-        Their answer transcript: "{request.transcript}"
-        Vision observations: "{request.vision_notes}"
+        The user was asked this interview question: "{request.question}"
+        
+        Their spoken answer: "{request.transcript}"
+        
+        Vision observations from camera: "{request.vision_notes}"
+        
+        As the Coach Agent, coordinate with your Speech Agent, Vision Agent, and Voice Agent sub-agents to analyze this response.
         
         Provide brief, actionable coaching feedback in 2-3 sentences max.
-        Focus on the most important improvement.
+        Focus on the single most important improvement the user should make.
+        Be encouraging and speak directly to the user.
         """
-        response = model.generate_content(prompt)
-        return {"feedback": response.text}
+        
+        # Call the root Coach Agent which orchestrates Speech, Vision, Voice agents
+        response = await root_agent.run_async(prompt)
+        feedback_text = str(response)
+        
+        return {"feedback": feedback_text}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Fallback to direct Gemini if agent fails
+        try:
+            fallback_model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+            fallback_prompt = f'The user answered "{request.question}" with: "{request.transcript}". Give 2-3 sentences of actionable interview coaching feedback.'
+            fallback_response = fallback_model.generate_content(fallback_prompt)
+            return {"feedback": fallback_response.text}
+        except Exception as fallback_error:
+            raise HTTPException(status_code=500, detail=str(fallback_error))
 
 @app.post("/score")
 async def get_scores(request: ScoreRequest):
     try:
+        # Use Speech Agent to analyze the full transcript
+        speech_prompt = f"""
+        Analyze this full interview transcript for speech quality: "{request.transcript}"
+        Rate speech clarity, structure, and relevance out of 100.
+        """
+        
+        # Use Vision Agent observations from feedback history
+        vision_feedback = [f for f in request.feedback_history if f.get('agent') == 'Vision']
+        speech_feedback = [f for f in request.feedback_history if f.get('agent') == 'Speech']
+        
+        # Use scoring model to generate final scores based on all agent feedback
         prompt = f"""
         Based on this interview transcript: "{request.transcript}"
-        And this feedback history: {json.dumps(request.feedback_history)}
+        
+        Speech Agent observations: {json.dumps(speech_feedback)}
+        Vision Agent observations: {json.dumps(vision_feedback)}
+        All feedback history: {json.dumps(request.feedback_history)}
         
         Return ONLY a JSON object with these exact fields, no other text:
         {{
@@ -86,7 +116,7 @@ async def get_scores(request: ScoreRequest):
             "improvements": ["improvement1", "improvement2", "improvement3"]
         }}
         """
-        response = model.generate_content(prompt)
+        response = scoring_model.generate_content(prompt)
         text = response.text.strip()
         if "```" in text:
             text = text.split("```")[1]
