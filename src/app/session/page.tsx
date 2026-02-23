@@ -114,6 +114,8 @@ export default function SessionPage() {
   }, [mediaStream]);
 
   const handleEndSession = useCallback(() => {
+    console.log('Saving transcript:', sessionTranscriptRef.current);
+    console.log('Saving feedback history:', feedbackHistory);
     sessionStorage.setItem('transcript', sessionTranscriptRef.current);
     sessionStorage.setItem('feedbackHistory', JSON.stringify(feedbackHistory));
     router.push('/results');
@@ -143,7 +145,19 @@ export default function SessionPage() {
     utterance.pitch = 1;
     utterance.rate = 1;
 
+    const timeout = setTimeout(() => {
+      if (isSynthesizingRef.current) {
+        isSynthesizingRef.current = false;
+        setIsSynthesizing(false);
+        if (speechRecognitionRef.current && isMicOn) {
+          try { speechRecognitionRef.current.start(); } catch(e) {}
+        }
+        onEndCallback?.();
+      }
+    }, (text.length * 80) + 1000);
+
     utterance.onend = () => {
+      clearTimeout(timeout);
       isSynthesizingRef.current = false;
       setIsSynthesizing(false);
       if (speechRecognitionRef.current && isMicOn) {
@@ -266,7 +280,7 @@ export default function SessionPage() {
 
   useEffect(() => {
     if (backendUrl) {
-      fetch(`${backendUrl}/health`).catch(() => {});
+      fetch(`${backendUrl}/api/warmup`).catch(() => {});
     }
 
     async function setupMediaAndRecognition() {
@@ -292,14 +306,15 @@ export default function SessionPage() {
         const firstQuestion = mainQuestions[0];
         setCurrentQuestion(firstQuestion);
 
-        // FIX: wait for voices to load before speaking
         const speakWhenReady = () => {
           const voices = window.speechSynthesis.getVoices();
           if (voices.length > 0) {
-            speak(firstQuestion, () => setIsTimerRunning(true));
+            speak(firstQuestion);
+            setTimeout(() => setIsTimerRunning(true), 1000);
           } else {
             window.speechSynthesis.onvoiceschanged = () => {
-              speak(firstQuestion, () => setIsTimerRunning(true));
+              speak(firstQuestion);
+              setTimeout(() => setIsTimerRunning(true), 1000);
             };
           }
         };
@@ -344,10 +359,9 @@ export default function SessionPage() {
               try { recognition.start(); } catch(e) {}
             }
           };
-
-          // FIX: use isProcessingRef not isProcessing state to avoid stale closure
+          
           recognition.onend = () => {
-            if (isMicOn && !isSynthesizingRef.current && !isProcessingRef.current) {
+            if (isMicOn && !isSynthesizingRef.current) {
               try { recognition.start(); } catch(e) {}
             }
           };
