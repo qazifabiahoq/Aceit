@@ -114,8 +114,6 @@ export default function SessionPage() {
   }, [mediaStream]);
 
   const handleEndSession = useCallback(() => {
-    console.log('Transcript being saved:', sessionTranscriptRef.current);
-    console.log('Feedback history being saved:', feedbackHistory);
     sessionStorage.setItem('transcript', sessionTranscriptRef.current);
     sessionStorage.setItem('feedbackHistory', JSON.stringify(feedbackHistory));
     router.push('/results');
@@ -268,7 +266,7 @@ export default function SessionPage() {
 
   useEffect(() => {
     if (backendUrl) {
-      fetch(`${backendUrl}/api/warmup`).catch(() => {});
+      fetch(`${backendUrl}/health`).catch(() => {});
     }
 
     async function setupMediaAndRecognition() {
@@ -283,10 +281,6 @@ export default function SessionPage() {
         });
         mediaStreamRef.current = stream;
         setMediaStream(stream);
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.play().catch(e => console.error('Video play error:', e));
-        }
         setHasCameraPermission(true);
         setHasMicPermission(true);
 
@@ -346,11 +340,14 @@ export default function SessionPage() {
             if (event.error === 'not-allowed') {
               setHasMicPermission(false);
             }
+            if (event.error === 'no-speech' || event.error === 'audio-capture') {
+              try { recognition.start(); } catch(e) {}
+            }
           };
 
           // FIX: use isProcessingRef not isProcessing state to avoid stale closure
           recognition.onend = () => {
-            if (isMicOn) {
+            if (isMicOn && !isSynthesizingRef.current && !isProcessingRef.current) {
               try { recognition.start(); } catch(e) {}
             }
           };
