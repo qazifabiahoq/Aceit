@@ -266,7 +266,7 @@ export default function SessionPage() {
 
   useEffect(() => {
     if (backendUrl) {
-      fetch(`${backendUrl}/health`).catch(() => {});
+      fetch(`${backendUrl}/api/warmup`).catch(() => {});
     }
 
     async function setupMediaAndRecognition() {
@@ -344,7 +344,7 @@ export default function SessionPage() {
 
           // FIX: use isProcessingRef not isProcessing state to avoid stale closure
           recognition.onend = () => {
-            if (isMicOn && !isSynthesizingRef.current && !isProcessingRef.current) {
+            if (isMicOn && !isSynthesizingRef.current) {
               try { recognition.start(); } catch(e) {}
             }
           };
