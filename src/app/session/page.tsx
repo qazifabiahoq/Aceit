@@ -301,13 +301,11 @@ export default function SessionPage() {
 
     async function setupMediaAndRecognition() {
       try {
+        // FIX: only request video, NOT audio
+        // Web Speech API and getUserMedia audio cannot share the mic on Windows Chrome
         const stream = await navigator.mediaDevices.getUserMedia({
           video: true,
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            sampleRate: 44100,
-          }
+          audio: false,
         });
         mediaStreamRef.current = stream;
         setMediaStream(stream);
@@ -330,6 +328,9 @@ export default function SessionPage() {
           recognition.lang = 'en-US';
 
           recognition.onresult = (event: any) => {
+            // ignore results while AI is speaking
+            if (isSynthesizingRef.current) return;
+
             let interimTranscript = '';
             let finalTranscript = '';
             for (let i = event.resultIndex; i < event.results.length; ++i) {
