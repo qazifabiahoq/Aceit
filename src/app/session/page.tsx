@@ -328,9 +328,6 @@ export default function SessionPage() {
           recognition.lang = 'en-US';
 
           recognition.onresult = (event: any) => {
-            // ignore results while AI is speaking
-            if (isSynthesizingRef.current) return;
-
             let interimTranscript = '';
             let finalTranscript = '';
             for (let i = event.resultIndex; i < event.results.length; ++i) {
