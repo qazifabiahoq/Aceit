@@ -38,6 +38,8 @@ import { realtimeVisionAnalysis } from '@/ai/flows/realtime-vision-analysis-flow
 import { realtimeCoachingFeedback } from '@/ai/flows/realtime-coaching-feedback-flow';
 import { generateSingleFollowupQuestion } from '@/ai/flows/generate-single-followup-question-flow';
 
+const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
+
 const mainQuestions = [
   'Tell me about yourself.',
   'What are your biggest strengths?',
@@ -257,6 +259,10 @@ export default function SessionPage() {
   }, []);
 
   useEffect(() => {
+    if (backendUrl) {
+      fetch(`${backendUrl}/api/warmup`).catch(err => console.error("Failed to warm up backend:", err));
+    }
+
     async function setupMediaAndRecognition() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({

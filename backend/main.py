@@ -48,6 +48,10 @@ class ScoreRequest(BaseModel):
 def health_check():
     return {"status": "AceIt backend running", "version": "1.0"}
 
+@app.get("/api/warmup")
+def warmup():
+    return {"status": "ok"}
+
 @app.post("/coach")
 async def get_coaching(request: CoachRequest):
     try:
